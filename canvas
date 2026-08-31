@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+"""
+canvas.py — headless UF Canvas assignment fetcher
+
+What it does:
+- Reuses a persistent Chromium session for https://ufl.instructure.com
+- Automates UF primary login with a local username and macOS Keychain password
+- Requests one Duo Push for the user to approve in Duo Mobile when required
+- Uses Canvas's read-only API through that authenticated browser session
+- Prints assignment name, course, due date, instructions, URL, and submission status
+- Supports --json for use by agents
+
+Install:
+    python3 -m pip install playwright
+    python3 -m playwright install chromium
+
+Usage:
+    python3 canvas.py
+    python3 canvas.py auth setup
+    python3 canvas.py --course NUR3145
+    python3 canvas.py --course
+    python3 canvas.py --list-courses --json
+    python3 canvas.py --status all --shorten --json
+    python3 canvas.py --days 7
+    python3 canvas.py --days all     # all future assignments and assignments without due dates
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import html
+import json
+import os
+import re
+import select
+import stat
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print(
+        "Missing dependency: playwright\n\n"
+        "Install it with:\n"
+        "  python3 -m pip install playwright\n"
+        "  python3 -m playwright install chromium",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+BASE_URL = "https://ufl.instructure.com"
+PROFILE_URL = BASE_URL + "/api/v1/users/self/profile"
+LOGIN_URL = BASE_URL + "/login/saml"
+PROFILE_DIR = Path.home() / ".canvas-agent-browser"
+CONFIG_DIR_NAME = "canvas-cli"
+KEYCHAIN_SERVICE = "canvas-cli.ufl"
+KEYCHAIN_LABEL = "UF Canvas CLI"
+DUO_OPTION_WAIT_SECONDS = 5
+PRIMARY_FORM_WAIT_SECONDS = 15
+CREDENTIALS_ERROR = "Canvas credentials are not configured. Run: canvas auth setup"
+DUO_TIMEOUT_SECONDS = 180
+
+
+@dataclass(frozen=True)
+class Credentials:
+    username: str
+    password: str
+
+
+class AuthError(RuntimeError):
+    pass
+
+
+def _credentials_error() -> AuthError:
+    return AuthError(CREDENTIALS_ERROR)
+
+
+def _config_dir() -> Path:
+    root = Path(
+        os.environ.get("XDG_CONFIG_HOME")
+        or (Path.home() / ".config")
+    )
+    directory = root / CONFIG_DIR_NAME
+    try:
+        if directory.is_symlink():
+            raise _credentials_error()
+        if directory.exists():
+            if not stat.S_ISDIR(directory.stat().st_mode):
+                raise _credentials_error()
+        else:
+            directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+    except AuthError:
+        raise
+    except OSError as exc:
+        raise _credentials_error() from exc
+    return directory
+
+
+def _config_path() -> Path:
+    return _config_dir() / "config.json"
+
+
+def _validated_username(value: str) -> str:
+    username = value.strip()
+    if not username or any(character.isspace() for character in username):
+        raise _credentials_error()
+    return username
+
+
+def _write_username_config(username: str) -> None:
+    path = _config_path()
+    try:
+        if path.is_symlink():
+            raise _credentials_error()
+        if path.exists() and not stat.S_ISREG(path.stat().st_mode):
+            raise _credentials_error()
+    except AuthError:
+        raise
+    except OSError as exc:
+        raise _credentials_error() from exc
+
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".config.",
+            dir=str(path.parent),
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"username": username}, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        path.chmod(0o600)
+    except AuthError:
+        raise
+    except OSError as exc:
+        raise _credentials_error() from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _store_keychain_password(username: str) -> None:
+    command = [
+        "/usr/bin/security",
+        "add-generic-password",
+        "-U",
+        "-a",
+        username,
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-l",
+        KEYCHAIN_LABEL,
+        "-w",
+    ]
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        raise _credentials_error() from exc
+    if result.returncode != 0:
+        raise _credentials_error()
+
+
+def _read_keychain_password(username: str) -> str:
+    command = [
+        "/usr/bin/security",
+        "find-generic-password",
+        "-a",
+        username,
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-w",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise _credentials_error() from exc
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        raise _credentials_error()
+    password = (
+        result.stdout[:-1]
+        if result.stdout.endswith("\n")
+        else result.stdout
+    )
+    if not password:
+        raise _credentials_error()
+    return password
+
+
+def configure_auth() -> int:
+    try:
+        username = _validated_username(input("GatorLink username: "))
+        _store_keychain_password(username)
+        _read_keychain_password(username)
+        _write_username_config(username)
+    except AuthError:
+        raise
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise _credentials_error() from exc
+
+    print("Canvas credentials configured.", file=sys.stderr)
+    return 0
+
+
+def load_credentials() -> Credentials:
+    path = _config_path()
+    try:
+        if path.is_symlink() or not path.exists():
+            raise _credentials_error()
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise _credentials_error()
+        with path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except AuthError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise _credentials_error() from exc
+
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"username"}
+        or not isinstance(config["username"], str)
+    ):
+        raise _credentials_error()
+
+    username = _validated_username(config["username"])
+    return Credentials(username, _read_keychain_password(username))
+
+
+class _HTMLToText(HTMLParser):
+    BLOCK_TAGS = {
+        "p", "div", "section", "article", "header", "footer",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "ul", "ol", "li", "table", "tr", "blockquote", "pre",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "br":
+            self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n• ")
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self) -> str:
+        text = html.unescape("".join(self.parts))
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def html_to_text(value: str | None) -> str:
+    if not value:
+        return ""
+    parser = _HTMLToText()
+    try:
+        parser.feed(value)
+        return parser.text()
+    except Exception:
+        return re.sub(r"<[^>]+>", "", html.unescape(value)).strip()
+
+
+def parse_canvas_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _api_response(page, path: str, params: list[tuple[str, str]] | None = None):
+    url = BASE_URL + path
+    if params:
+        url += "?" + urlencode(params)
+
+    result = page.evaluate(
+        """async (url) => {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            try {
+                const response = await fetch(url, {
+                    method: "GET",
+                    credentials: "include",
+                    headers: {"Accept": "application/json"},
+                    signal: controller.signal
+                });
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    text: await response.text()
+                };
+            } catch (e) {
+                return {
+                    ok: false,
+                    status: 0,
+                    text: e.name === "AbortError"
+                        ? "Canvas API request timed out"
+                        : String(e)
+                };
+            } finally {
+                clearTimeout(timeout);
+            }
+        }""",
+        url,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Canvas API returned an invalid response.")
+    return result
+
+
+def api_get(page, path: str, params: list[tuple[str, str]] | None = None):
+    result = _api_response(page, path, params)
+
+    if not result.get("ok"):
+        text = str(result.get("text") or "")
+        raise RuntimeError(
+            f"Canvas API request failed ({result.get('status', 0)}): {path}\n"
+            f"{text[:500]}"
+        )
+
+    try:
+        return json.loads(result["text"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Canvas returned a non-JSON response for {path}. "
+            "Your login session may have expired."
+        ) from exc
+
+
+
+
+def paginated_get(page, path: str, params: list[tuple[str, str]] | None = None):
+    params = list(params or [])
+    out = []
+    page_number = 1
+
+    while True:
+        current = params + [
+            ("per_page", "100"),
+            ("page", str(page_number)),
+        ]
+        data = api_get(page, path, current)
+
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected Canvas response for {path}")
+
+        out.extend(data)
+
+        if len(data) < 100:
+            return out
+
+        page_number += 1
+def is_logged_in(page) -> bool:
+    result = _api_response(page, "/api/v1/users/self/profile")
+    if result.get("status") == 401:
+        return False
+    if not result.get("ok"):
+        text = str(result.get("text") or "")
+        raise RuntimeError(
+            "Canvas session check failed "
+            f"({result.get('status', 0)}): {text[:500]}"
+        )
+
+    try:
+        profile = json.loads(result["text"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Canvas returned an invalid profile response.") from exc
+
+    if not isinstance(profile, dict) or not profile.get("id"):
+        raise RuntimeError("Canvas returned an invalid profile response.")
+    return True
+
+
+def launch_context(playwright):
+    return playwright.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        headless=True,
+        viewport={"width": 1280, "height": 900},
+    )
+
+
+def _auth_surfaces(page):
+    surfaces = [page]
+    try:
+        surfaces.extend(page.frames)
+    except Exception:
+        pass
+
+    seen = set()
+    for surface in surfaces:
+        identity = id(surface)
+        if identity not in seen:
+            seen.add(identity)
+            yield surface
+
+
+def _first_visible(surface, locators):
+    for locator in locators:
+        try:
+            count = locator.count()
+            for index in range(count):
+                candidate = locator.nth(index)
+                if candidate.is_visible():
+                    return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _primary_form_controls(page):
+    username = _first_visible(
+        page,
+        [
+            page.get_by_label("Username", exact=True),
+            page.locator('input[autocomplete="username"]'),
+            page.locator('input[name="j_username"]'),
+            page.locator('input[name="username"]'),
+        ],
+    )
+    password = _first_visible(
+        page,
+        [
+            page.get_by_label("Password", exact=True),
+            page.locator('input[autocomplete="current-password"]'),
+            page.locator('input[name="j_password"]'),
+            page.locator('input[type="password"]'),
+        ],
+    )
+    submit = _first_visible(
+        page,
+        [
+            page.locator('button[type="submit"]'),
+            page.locator('input[type="submit"]'),
+        ],
+    )
+    return username, password, submit
+
+
+def fill_primary_credentials(page, credentials: Credentials) -> None:
+    deadline = time.monotonic() + PRIMARY_FORM_WAIT_SECONDS
+    saw_loading = _page_has_text(page, LOGIN_LOADING)
+    while True:
+        username, password, submit = _primary_form_controls(page)
+        if username is not None and password is not None and submit is not None:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("UF login form was not recognized.")
+        if not saw_loading:
+            saw_loading = _page_has_text(page, LOGIN_LOADING)
+            if not saw_loading:
+                raise RuntimeError("UF login form was not recognized.")
+        try:
+            page.wait_for_timeout(100)
+        except Exception:
+            time.sleep(0.1)
+
+    username.fill(credentials.username)
+    password.fill(credentials.password)
+    submit.click()
+
+
+PRIMARY_AUTH_FAILURE = re.compile(
+    r"invalid (?:username|user name|credentials?)"
+    r"|incorrect (?:username|user name|password|credentials?)"
+    r"|authentication failed"
+    r"|login failed"
+    r"|credentials? (?:are )?invalid",
+    re.IGNORECASE,
+)
+DUO_PUSH_SENT = re.compile(
+    r"check for a duo push"
+    r"|a login request was sent to your device"
+    r"|we['’]ve sent a notification",
+    re.IGNORECASE,
+)
+DUO_PUSH_CONTROL = re.compile(
+    r"send me a push"
+    r"|send a push"
+    r"|duo push"
+    r"|verify with duo push",
+    re.IGNORECASE,
+)
+OTHER_OPTIONS_CONTROL = re.compile(r"other options", re.IGNORECASE)
+LOGIN_LOADING = re.compile(
+    r"loading (?:login )?session information|automatically redirected",
+    re.IGNORECASE,
+)
+
+
+def _surface_text(surface) -> str:
+    try:
+        return surface.locator("body").inner_text(timeout=1000)
+    except Exception:
+        return ""
+
+
+def _page_has_text(page, pattern: re.Pattern[str]) -> bool:
+    return any(pattern.search(_surface_text(surface)) for surface in _auth_surfaces(page))
+
+
+def _control_label(control) -> str:
+    values = []
+    try:
+        values.append(control.inner_text())
+    except Exception:
+        pass
+    for attribute in ("value", "aria-label", "title"):
+        try:
+            value = control.get_attribute(attribute)
+        except Exception:
+            value = None
+        if value:
+            values.append(value)
+    return " ".join(values)
+
+
+def _find_control(page, pattern: re.Pattern[str]):
+    for surface in _auth_surfaces(page):
+        try:
+            role_control = _first_visible(
+                surface,
+                [surface.get_by_role("button", name=pattern)],
+            )
+        except Exception:
+            role_control = None
+        if role_control is not None:
+            return role_control
+
+        for selector in (
+            "button",
+            'input[type="button"]',
+            'input[type="submit"]',
+            "a",
+        ):
+            try:
+                controls = surface.locator(selector)
+                for index in range(controls.count()):
+                    control = controls.nth(index)
+                    if control.is_visible() and pattern.search(_control_label(control)):
+                        return control
+            except Exception:
+                continue
+    return None
+
+
+def request_duo_push(page) -> bool:
+    if _page_has_text(page, DUO_PUSH_SENT):
+        return True
+
+    direct_control = _find_control(page, DUO_PUSH_CONTROL)
+    if direct_control is not None:
+        direct_control.click()
+        return True
+
+    other_options = _find_control(page, OTHER_OPTIONS_CONTROL)
+    if other_options is None:
+        return False
+
+    other_options.click()
+    deadline = time.monotonic() + DUO_OPTION_WAIT_SECONDS
+    while True:
+        duo_control = _find_control(page, DUO_PUSH_CONTROL)
+        if duo_control is not None:
+            duo_control.click()
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        try:
+            page.wait_for_timeout(100)
+        except Exception:
+            time.sleep(0.1)
+
+
+def _duo_prompt_visible(page) -> bool:
+    return (
+        _page_has_text(page, DUO_PUSH_SENT)
+        or _find_control(page, DUO_PUSH_CONTROL) is not None
+        or _find_control(page, OTHER_OPTIONS_CONTROL) is not None
+    )
+
+
+def _wait_for_duo_approval(page) -> bool:
+    deadline = time.monotonic() + DUO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if page.is_closed():
+            raise RuntimeError("Duo approval was not completed within 180 seconds.")
+        if page.url.startswith(BASE_URL) and is_logged_in(page):
+            return True
+        time.sleep(1)
+
+    raise RuntimeError("Duo approval was not completed within 180 seconds.")
+
+
+def ensure_login(page) -> bool:
+    response = page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
+    if response is not None and response.status == 200:
+        try:
+            profile = json.loads(response.text())
+            if isinstance(profile, dict) and profile.get("id"):
+                return True
+        except Exception:
+            pass
+    if is_logged_in(page):
+        return True
+
+    credentials = load_credentials()
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+    fill_primary_credentials(page, credentials)
+
+    post_primary_deadline = time.monotonic() + 15
+    push_checked = False
+    while time.monotonic() < post_primary_deadline:
+        if page.is_closed():
+            raise RuntimeError("UF login ended before Canvas authentication completed.")
+        if _page_has_text(page, PRIMARY_AUTH_FAILURE):
+            raise RuntimeError(
+                "UF rejected the stored credentials. Run: canvas auth setup"
+            )
+        if page.url.startswith(BASE_URL) and is_logged_in(page):
+            return True
+        if not push_checked and _duo_prompt_visible(page):
+            push_checked = True
+            if not request_duo_push(page):
+                raise RuntimeError("Duo Push is not available for this account.")
+            print("Duo Push sent; approve it in Duo Mobile.", file=sys.stderr)
+            return _wait_for_duo_approval(page)
+        time.sleep(0.25)
+
+    if _page_has_text(page, PRIMARY_AUTH_FAILURE):
+        raise RuntimeError(
+            "UF rejected the stored credentials. Run: canvas auth setup"
+        )
+    if page.url.startswith(BASE_URL) and is_logged_in(page):
+        return True
+    if not push_checked:
+        push_checked = True
+        if request_duo_push(page):
+            print("Duo Push sent; approve it in Duo Mobile.", file=sys.stderr)
+            return _wait_for_duo_approval(page)
+    raise RuntimeError("Duo Push is not available for this account.")
+
+
+def submission_status(assignment: dict) -> str:
+    submission = assignment.get("submission") or {}
+
+    if submission.get("missing"):
+        return "missing"
+    if submission.get("late"):
+        return "late"
+    if submission.get("workflow_state") == "graded":
+        return "graded"
+    if submission.get("submitted_at"):
+        return "submitted"
+
+    return "unsubmitted"
+
+
+
+
+def fetch_courses(page):
+    return paginated_get(
+        page,
+        "/api/v1/courses",
+        [
+            ("enrollment_state", "active"),
+            ("include[]", "term"),
+        ],
+    )
+
+
+def normalize_course_filters(values: list[str] | None) -> set[str]:
+    filters = set()
+    for value in values or []:
+        normalized = value.strip().casefold()
+        if not normalized:
+            raise ValueError("--course requires a non-empty value")
+        filters.add(normalized)
+    return filters
+
+
+def course_matches(course: dict, filters: set[str]) -> bool:
+    if not filters:
+        return True
+    return any(
+        isinstance(value, str) and value.strip().casefold() in filters
+        for value in (course.get("course_code"), course.get("name"))
+    )
+
+def normalize_days(value: str | int | None) -> int:
+    if value is None:
+        return 14
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "all":
+            return 0
+        try:
+            days = int(normalized)
+        except ValueError:
+            raise ValueError("--days must be a non-negative integer or 'all'")
+    else:
+        days = int(value)
+    if days < 0:
+        raise ValueError("--days must be a non-negative integer or 'all'")
+    return days
+
+
+def filter_courses(courses: list[dict], filters: set[str]) -> list[dict]:
+    return [course for course in courses if course_matches(course, filters)]
+
+
+STATUS_FILTERS = ("unsubmitted", "submitted", "graded", "all")
+
+
+def normalize_status_filter(value: str) -> str:
+    normalized = value.strip().casefold()
+    if normalized not in STATUS_FILTERS:
+        allowed = ", ".join(STATUS_FILTERS)
+        raise ValueError(f"--status must be one of: {allowed}")
+    return normalized
+
+
+def status_matches(status: str, status_filter: str) -> bool:
+    if status_filter == "all":
+        return True
+    return status == status_filter
+
+
+def course_label(course: dict) -> str:
+    course_code = str(course.get("course_code") or "").strip()
+    name = str(course.get("name") or "").strip()
+    if course_code and name and course_code.casefold() != name.casefold():
+        return f"{course_code} — {name}"
+    return course_code or name or f"Course {course.get('id', 'unknown')}"
+
+
+def course_summary(course: dict) -> dict:
+    return {
+        "id": course.get("id"),
+        "course_code": course.get("course_code"),
+        "name": course.get("name"),
+    }
+
+
+def _ordered_courses(courses: list[dict]) -> list[dict]:
+    return sorted(courses, key=lambda item: course_label(item).casefold())
+
+
+def print_courses(courses: list[dict]) -> None:
+    if not courses:
+        print("No active courses found.")
+        return
+
+    for index, course in enumerate(_ordered_courses(courses), 1):
+        print(f"{index}. {course_label(course)}")
+
+
+def _read_terminal_key(stream) -> str:
+    descriptor = stream.fileno()
+    first = os.read(descriptor, 1)
+    if not first:
+        return "cancel"
+    if first == b"\x1b":
+        sequence = b""
+        for _ in range(2):
+            ready, _, _ = select.select([descriptor], [], [], 0.05)
+            if not ready:
+                return "cancel"
+            sequence += os.read(descriptor, 1)
+        return {"[A": "up", "[B": "down"}.get(
+            sequence.decode("ascii", errors="ignore"),
+            "cancel",
+        )
+    if first in (b"\r", b"\n"):
+        return "confirm"
+    if first == b" ":
+        return "toggle"
+    if first in (b"\x03", b"q", b"Q"):
+        return "cancel"
+    if first in (b"k", b"K"):
+        return "up"
+    if first in (b"j", b"J"):
+        return "down"
+    return "unknown"
+
+
+@contextlib.contextmanager
+def _cbreak_terminal(stream):
+    descriptor = stream.fileno()
+    attributes = termios.tcgetattr(descriptor)
+    try:
+        tty.setcbreak(descriptor)
+        yield
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, attributes)
+
+
+def _terminal_width(stream) -> int:
+    try:
+        columns = os.get_terminal_size(stream.fileno()).columns
+    except (AttributeError, OSError, ValueError):
+        return 80
+    return columns if columns > 0 else 80
+
+
+def _terminal_height(stream) -> int:
+    try:
+        rows = os.get_terminal_size(stream.fileno()).lines
+    except (AttributeError, OSError, ValueError):
+        return 24
+    return rows if rows > 0 else 24
+
+
+def _picker_visible_count(stream, message: str) -> int:
+    reserved_lines = 3 + (2 if message else 0)
+    return max(1, _terminal_height(stream) - reserved_lines)
+
+
+def _picker_window_start(cursor: int, total: int, visible_count: int) -> int:
+    return min(
+        max(0, cursor - visible_count + 1),
+        max(0, total - visible_count),
+    )
+
+
+def _clear_terminal(stream) -> None:
+    stream.write("\x1b[2J\x1b[H")
+
+
+def _terminal_char_width(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _terminal_cell_width(text: str) -> int:
+    return sum(_terminal_char_width(char) for char in text)
+
+
+def _take_terminal_cells(text: str, width: int) -> str:
+    result = []
+    used = 0
+    for char in text:
+        char_width = _terminal_char_width(char)
+        if used + char_width > width:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result)
+
+
+def _fit_terminal_line(value, width: int) -> str:
+    text = "".join(char if char.isprintable() else " " for char in str(value))
+    if _terminal_cell_width(text) <= width:
+        return text
+    if width <= 3:
+        return _take_terminal_cells(text, width)
+    return _take_terminal_cells(text, width - 3) + "..."
+
+
+def _render_course_picker(
+    courses: list[dict],
+    cursor: int,
+    selected: set[int],
+    stdout,
+    message: str = "",
+    *,
+    start: int | None = None,
+    visible_count: int | None = None,
+) -> None:
+    # Leave one column unused so terminals do not autowrap at the edge.
+    width = max(1, _terminal_width(stdout) - 1)
+    visible_count = (
+        _picker_visible_count(stdout, message)
+        if visible_count is None
+        else max(1, visible_count)
+    )
+    start = (
+        _picker_window_start(cursor, len(courses), visible_count)
+        if start is None
+        else max(0, start)
+    )
+    end = min(len(courses), start + visible_count)
+    lines = [
+        _fit_terminal_line(
+            "Select courses "
+            "(Up/Down or j/k move, Space toggle, Enter apply, q cancel)",
+            width,
+        ),
+        _fit_terminal_line(
+            f"Selected: {len(selected)} | Showing {start + 1}-{end} of {len(courses)}",
+            width,
+        ),
+    ]
+    for index in range(start, end):
+        course = courses[index]
+        marker = ">" if index == cursor else " "
+        checked = "x" if index in selected else " "
+        lines.append(
+            _fit_terminal_line(
+                f"{marker} [{checked}] {course_label(course)}",
+                width,
+            )
+        )
+    if message:
+        lines.extend(["", _fit_terminal_line(message, width)])
+    _clear_terminal(stdout)
+    stdout.write("\n".join(lines) + "\n")
+    stdout.flush()
+
+
+def _render_course_loading(stdout, selected_count: int) -> None:
+    width = max(1, _terminal_width(stdout) - 1)
+    plural = "course" if selected_count == 1 else "courses"
+    lines = [
+        _fit_terminal_line("Loading Canvas data...", width),
+        _fit_terminal_line(
+            f"Processing {selected_count} selected {plural}.",
+            width,
+        ),
+    ]
+    _clear_terminal(stdout)
+    stdout.write("\n".join(lines) + "\n")
+    stdout.flush()
+
+
+def _run_course_picker(courses, read_key, stdout):
+    selected: set[int] = set()
+    cursor = 0
+    message = ""
+    while True:
+        _render_course_picker(courses, cursor, selected, stdout, message)
+        key = read_key()
+        if key == "up":
+            cursor = (cursor - 1) % len(courses)
+            message = ""
+        elif key == "down":
+            cursor = (cursor + 1) % len(courses)
+            message = ""
+        elif key == "toggle":
+            if cursor in selected:
+                selected.remove(cursor)
+            else:
+                selected.add(cursor)
+            message = ""
+        elif key == "confirm":
+            if not selected:
+                message = "Select at least one course before pressing Enter."
+                continue
+            selected_courses = [
+                courses[index] for index in range(len(courses)) if index in selected
+            ]
+            _render_course_loading(stdout, len(selected_courses))
+            return selected_courses
+        elif key == "cancel":
+            stdout.write("\n")
+            stdout.flush()
+            raise RuntimeError("Course selection cancelled.")
+        else:
+            message = "Use Up/Down, Space, Enter, or q."
+
+
+
+@contextlib.contextmanager
+def _picker_terminal_session(stdin, stdout):
+    if not stdin.isatty() or not stdout.isatty():
+        raise RuntimeError(
+            "Interactive course selection requires a terminal. "
+            "Use --course NAME or --list-courses."
+        )
+    stdout.write("\x1b[?1049h\x1b[?25l")
+    stdout.flush()
+    try:
+        with _cbreak_terminal(stdin):
+            try:
+                yield
+            finally:
+                _flush_terminal_input(stdin)
+    finally:
+        stdout.write("\x1b[?25h\x1b[?1049l")
+        stdout.flush()
+
+
+def _flush_terminal_input(stdin) -> None:
+    try:
+        termios.tcflush(stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+def _select_ordered_courses(ordered, stdin, stdout):
+    if not ordered:
+        return []
+    selected = _run_course_picker(
+        ordered,
+        lambda: _read_terminal_key(stdin),
+        stdout,
+    )
+    _flush_terminal_input(stdin)
+    return selected
+
+def select_courses(
+    courses: list[dict],
+    *,
+    read_key=None,
+    stdin=None,
+    stdout=None,
+) -> list[dict]:
+    ordered = _ordered_courses(courses)
+    if not ordered:
+        return []
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stderr if stdout is None else stdout
+
+    if read_key is not None:
+        return _run_course_picker(ordered, read_key, stdout)
+    with _picker_terminal_session(stdin, stdout):
+        return _select_ordered_courses(ordered, stdin, stdout)
+
+
+def batch_fetch_course_assignments(page, course_ids: list[int | str]) -> list[dict]:
+    if not course_ids:
+        return []
+    return page.evaluate(
+        """async ({ courseIds, baseUrl }) => {
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            const fetchCourse = async (courseId) => {
+                let url = `${baseUrl}/api/v1/courses/${courseId}/assignments?order_by=due_at&include[]=submission&per_page=100`;
+                const items = [];
+                while (url) {
+                    let attempt = 0;
+                    let success = false;
+                    while (attempt < 3 && !success) {
+                        attempt++;
+                        const controller = new AbortController();
+                        const timeout = setTimeout(() => controller.abort(), 15000);
+                        try {
+                            const response = await fetch(url, {
+                                method: "GET",
+                                credentials: "include",
+                                headers: {"Accept": "application/json"},
+                                signal: controller.signal
+                            });
+
+                            const isRateLimit = response.status === 429 || (
+                                response.status === 403 && (await response.clone().text()).toLowerCase().includes("rate limit")
+                            );
+
+                            if (isRateLimit && attempt < 3) {
+                                const retryAfter = parseInt(response.headers.get("Retry-After") || "0", 10);
+                                const delay = retryAfter > 0 ? retryAfter * 1000 : (attempt * 800 + Math.random() * 300);
+                                await sleep(delay);
+                                continue;
+                            }
+
+                            if (!response.ok) {
+                                return {
+                                    courseId,
+                                    ok: false,
+                                    status: response.status,
+                                    error: (await response.text()).slice(0, 500),
+                                    items: []
+                                };
+                            }
+                            const data = await response.json();
+                            if (Array.isArray(data)) {
+                                items.push(...data);
+                            }
+                            const linkHeader = response.headers.get("Link") || "";
+                            const nextMatch = linkHeader.match(/<([^>]+)>;\\s*rel="next"/);
+                            url = nextMatch ? nextMatch[1] : null;
+                            success = true;
+                        } catch (e) {
+                            if (attempt < 3 && e.name === "AbortError") {
+                                await sleep(attempt * 500);
+                                continue;
+                            }
+                            return {
+                                courseId,
+                                ok: false,
+                                status: 0,
+                                error: e.name === "AbortError" ? "Canvas API request timed out" : String(e),
+                                items: []
+                            };
+                        } finally {
+                            clearTimeout(timeout);
+                        }
+                    }
+                }
+                return { courseId, ok: true, status: 200, items };
+            };
+
+            const concurrency = 6;
+            const results = new Array(courseIds.length);
+            let index = 0;
+            const workers = Array.from({ length: Math.min(concurrency, courseIds.length) }, async () => {
+                while (index < courseIds.length) {
+                    const i = index++;
+                    results[i] = await fetchCourse(courseIds[i]);
+                }
+            });
+            await Promise.all(workers);
+            return results;
+        }""",
+        {"courseIds": course_ids, "baseUrl": BASE_URL},
+    )
+
+
+def fetch_assignments(
+    page,
+    days: int | str = 14,
+    tz: ZoneInfo = ZoneInfo("America/New_York"),
+    courses: list[dict] | None = None,
+    status_filter: str = "unsubmitted",
+):
+    courses = fetch_courses(page) if courses is None else courses
+    status_filter = normalize_status_filter(status_filter)
+    days = normalize_days(days)
+
+    now = datetime.now(timezone.utc)
+    cutoff = None if days == 0 else now + timedelta(days=days)
+    rows = []
+
+    valid_courses = [c for c in courses if c.get("id")]
+    course_ids = [c["id"] for c in valid_courses]
+    batch_results = batch_fetch_course_assignments(page, course_ids)
+    batch_map = {r.get("courseId"): r for r in batch_results if isinstance(r, dict)}
+
+    for course in valid_courses:
+        course_id = course["id"]
+        course_name = (
+            course.get("course_code")
+            or course.get("name")
+            or f"Course {course_id}"
+        )
+        res = batch_map.get(course_id)
+        if not res or not res.get("ok"):
+            err_msg = res.get("error") if res else "No response returned"
+            print(f"Warning: skipped {course_name}: {err_msg}", file=sys.stderr)
+            continue
+
+        assignments = res.get("items") or []
+        for assignment in assignments:
+            if assignment.get("published") is False:
+                continue
+
+            due = parse_canvas_datetime(assignment.get("due_at"))
+
+            if due is None and cutoff is not None:
+                continue
+            if due is not None:
+                # Ignore assignments whose deadlines have already passed.
+                if due < now:
+                    continue
+                if cutoff is not None and due > cutoff:
+                    continue
+
+            status = submission_status(assignment)
+            if not status_matches(status, status_filter):
+                continue
+            instructions = html_to_text(assignment.get("description"))
+
+            rows.append(
+                {
+                    "course": course_name,
+                    "course_name": course.get("name") or course_name,
+                    "title": assignment.get("name") or "(Untitled assignment)",
+                    "due_at": due.isoformat() if due else None,
+                    "due_display": (
+                        due.astimezone(tz).strftime("%a, %b %d, %Y at %I:%M %p %Z")
+                        if due
+                        else "No due date"
+                    ),
+                    "instructions": instructions or "(No instructions provided)",
+                    "url": assignment.get("html_url") or "",
+                    "submission_status": status,
+                }
+            )
+
+    # Due-dated assignments first, then assignments without due dates.
+    rows.sort(
+        key=lambda item: (
+            item["due_at"] is None,
+            item["due_at"] or "9999-12-31T23:59:59+00:00",
+            item["course"].lower(),
+            item["title"].lower(),
+        )
+    )
+    return rows
+
+
+def shorten_rows(rows: list[dict]) -> list[dict]:
+    return [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"instructions", "submission_status"}
+        }
+        for row in rows
+    ]
+
+
+def print_human(rows, *, shorten: bool = False):
+    if not rows:
+        print("No upcoming assignments found.")
+        return
+
+    for index, item in enumerate(rows, 1):
+        print(f"{index}. {item['title']}")
+        print(f"   Course: {item['course']}")
+        print(f"   Due: {item['due_display']}")
+        if not shorten:
+            print(f"   Status: {item['submission_status']}")
+        if item["url"]:
+            print(f"   URL: {item['url']}")
+        if not shorten:
+            print("   Instructions:")
+            for line in item["instructions"].splitlines() or [""]:
+                print(f"     {line}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch upcoming UF Canvas assignments, deadlines, and instructions."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output machine-readable JSON (useful for agents).",
+    )
+    parser.add_argument(
+        "--shorten",
+        action="store_true",
+        help="Omit instructions and submission status from assignment output.",
+    )
+    parser.add_argument(
+        "--days",
+        default="14",
+        help="Only show assignments due within N days, or 'all' for all future assignments and assignments without due dates. Default: 14.",
+    )
+    parser.add_argument(
+        "--timezone",
+        default="America/New_York",
+        help="Timezone used for displaying deadlines. Default: America/New_York.",
+    )
+    parser.add_argument(
+        "--course",
+        dest="courses",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="Filter by course code or name; omit NAME for interactive multi-select.",
+    )
+    parser.add_argument(
+        "--list-courses",
+        action="store_true",
+        help="List active courses instead of assignments.",
+    )
+    parser.add_argument(
+        "--status",
+        choices=STATUS_FILTERS,
+        default="unsubmitted",
+        help="Assignment status to include: unsubmitted (default), submitted, graded, or all.",
+    )
+    args = parser.parse_args()
+
+    if args.command is not None:
+        if args.command != "auth" or args.action != "setup":
+            parser.error("the only supported subcommand is: canvas auth setup")
+        try:
+            return configure_auth()
+        except KeyboardInterrupt:
+            print("\nCancelled.", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.action is not None:
+        parser.error("the only supported subcommand is: canvas auth setup")
+    try:
+        days = normalize_days(args.days)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    interactive_course = any(value == "" for value in (args.courses or []))
+    if interactive_course and len(args.courses or []) != 1:
+        parser.error("--course without a name cannot be combined with another --course")
+    if interactive_course:
+        course_filters = set()
+    else:
+        try:
+            course_filters = normalize_course_filters(args.courses)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    try:
+        tz = ZoneInfo(args.timezone)
+    except Exception:
+        parser.error(f"Unknown timezone: {args.timezone}")
+
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with sync_playwright() as p:
+            context = launch_context(p)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                ensure_login(page)
+                available_courses = fetch_courses(page)
+                terminal_session = (
+                    _picker_terminal_session(sys.stdin, sys.stderr)
+                    if interactive_course
+                    else contextlib.nullcontext()
+                )
+                with terminal_session:
+                    courses = (
+                        _select_ordered_courses(
+                            _ordered_courses(available_courses),
+                            sys.stdin,
+                            sys.stderr,
+                        )
+                        if interactive_course
+                        else filter_courses(available_courses, course_filters)
+                    )
+                    if args.list_courses:
+                        course_rows = [
+                            course_summary(course)
+                            for course in sorted(
+                                courses,
+                                key=lambda item: course_label(item).casefold(),
+                            )
+                        ]
+                    else:
+                        rows = fetch_assignments(
+                            page,
+                            days,
+                            tz,
+                            courses=courses,
+                            status_filter=args.status,
+                        )
+                    if interactive_course:
+                        _flush_terminal_input(sys.stdin)
+            finally:
+                context.close()
+
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+    if args.list_courses:
+        if args.json:
+            print(json.dumps(course_rows, indent=2, ensure_ascii=False))
+        else:
+            print_courses(courses)
+    elif args.json:
+        output_rows = shorten_rows(rows) if args.shorten else rows
+        print(json.dumps(output_rows, indent=2, ensure_ascii=False))
+    else:
+        print_human(rows, shorten=args.shorten)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
