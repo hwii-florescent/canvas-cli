@@ -39,8 +39,8 @@ canvas auth setup
 ```
 
 The command prompts for the GatorLink username, then lets macOS
-`/usr/bin/security` prompt for the UF password. The config file contains
-only the trimmed username at:
+`/usr/bin/security` prompt for the UF password. The config file stores the
+trimmed username and persistent student mode at:
 
 ```text
 ${XDG_CONFIG_HOME:-$HOME/.config}/canvas-cli/config.json
@@ -167,6 +167,23 @@ canvas
 The default look-ahead window is 14 days. Day-window filters (`--days 14`,
 `--days 7`, etc.) only return assignments with an upcoming deadline.
 
+### Student enrollment mode
+
+The default persistent student mode is `on`, so ordinary `canvas` commands
+only include active courses where your Canvas enrollment type is `student`.
+Change the mode with:
+
+```bash
+canvas student off
+canvas student on
+canvas student status
+```
+
+`canvas student off` persists until `canvas student on` is run. With the mode
+off, assignment and course-list requests include all active enrollment types.
+These mode commands only read or update local configuration; they do not fetch
+Canvas data.
+
 ---
 
 ### Assignments due in the next 7 days
@@ -240,7 +257,8 @@ canvas --course NUR3145 --course BIO101
 
 ### List active courses
 
-List the active courses available for filtering:
+By default, only active courses where your Canvas enrollment type is `student`
+are listed. When student mode is off, all active enrollment types are included.
 
 ```bash
 canvas --list-courses
@@ -426,7 +444,7 @@ The CLI only fetches information when the `canvas` command is run.
 ${XDG_CONFIG_HOME:-$HOME/.config}/canvas-cli/config.json
 ```
 
-This file contains only the GatorLink username and must remain mode `0600`.
+This file contains the GatorLink username and persistent student mode and must remain mode `0600`.
 
 ### Saved browser login profile
 

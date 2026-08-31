@@ -17,6 +17,9 @@ Install:
 Usage:
     python3 canvas.py
     python3 canvas.py auth setup
+    python3 canvas.py student off
+    python3 canvas.py student on
+    python3 canvas.py student status
     python3 canvas.py --course NUR3145
     python3 canvas.py --course
     python3 canvas.py --list-courses --json
@@ -74,6 +77,11 @@ DUO_OPTION_WAIT_SECONDS = 5
 PRIMARY_FORM_WAIT_SECONDS = 15
 CREDENTIALS_ERROR = "Canvas credentials are not configured. Run: canvas auth setup"
 DUO_TIMEOUT_SECONDS = 180
+STUDENT_MODE_KEY = "student_mode"
+STUDENT_MODE_ON = "on"
+STUDENT_MODE_OFF = "off"
+STUDENT_MODES = (STUDENT_MODE_ON, STUDENT_MODE_OFF)
+STUDENT_MODE_COMMANDS = (*STUDENT_MODES, "status")
 
 
 @dataclass(frozen=True)
@@ -233,7 +241,46 @@ def _validated_username(value: str) -> str:
     return username
 
 
-def _write_username_config(username: str) -> None:
+def _validated_student_mode(value) -> str:
+    if value is None:
+        return STUDENT_MODE_ON
+    if not isinstance(value, str) or value not in STUDENT_MODES:
+        raise _credentials_error()
+    return value
+
+
+def _read_config(*, missing_ok: bool = False) -> dict:
+    path = _config_path()
+    try:
+        if path.is_symlink():
+            raise _credentials_error()
+        if not path.exists():
+            if missing_ok:
+                return {}
+            raise _credentials_error()
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise _credentials_error()
+        with path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except AuthError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise _credentials_error() from exc
+
+    if not isinstance(config, dict):
+        raise _credentials_error()
+    allowed_keys = {"username", STUDENT_MODE_KEY}
+    if set(config) - allowed_keys:
+        raise _credentials_error()
+    if "username" in config:
+        if not isinstance(config["username"], str):
+            raise _credentials_error()
+        _validated_username(config["username"])
+    _validated_student_mode(config.get(STUDENT_MODE_KEY))
+    return config
+
+
+def _write_config(config: dict) -> None:
     path = _config_path()
     try:
         if path.is_symlink():
@@ -254,7 +301,7 @@ def _write_username_config(username: str) -> None:
         temporary_path = Path(temporary_name)
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump({"username": username}, handle, separators=(",", ":"))
+            json.dump(config, handle, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -271,6 +318,45 @@ def _write_username_config(username: str) -> None:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _write_username_config(
+    username: str,
+    *,
+    student_mode: str = STUDENT_MODE_ON,
+) -> None:
+    student_mode = _validated_student_mode(student_mode)
+    config = {"username": username}
+    if student_mode != STUDENT_MODE_ON:
+        config[STUDENT_MODE_KEY] = student_mode
+    _write_config(config)
+
+
+def load_student_mode() -> str:
+    config = _read_config(missing_ok=True)
+    return _validated_student_mode(config.get(STUDENT_MODE_KEY))
+
+
+def set_student_mode(mode: str) -> str:
+    mode = _validated_student_mode(mode)
+    config = _read_config(missing_ok=True)
+    updated = {}
+    if "username" in config:
+        updated["username"] = config["username"]
+    updated[STUDENT_MODE_KEY] = mode
+    _write_config(updated)
+    return mode
+
+
+def student_mode_command(action: str) -> int:
+    if action == "status":
+        print(f"Student mode: {load_student_mode()}")
+        return 0
+    if action not in STUDENT_MODES:
+        raise ValueError(f"unknown student mode command: {action}")
+    mode = set_student_mode(action)
+    print(f"Student mode set to {mode}.")
+    return 0
 
 
 def _store_keychain_password(username: str) -> None:
@@ -327,10 +413,11 @@ def _read_keychain_password(username: str) -> str:
 
 def configure_auth() -> int:
     try:
+        student_mode = load_student_mode()
         username = _validated_username(input("GatorLink username: "))
         _store_keychain_password(username)
         _read_keychain_password(username)
-        _write_username_config(username)
+        _write_username_config(username, student_mode=student_mode)
     except AuthError:
         raise
     except (EOFError, KeyboardInterrupt) as exc:
@@ -341,24 +428,8 @@ def configure_auth() -> int:
 
 
 def load_credentials() -> Credentials:
-    path = _config_path()
-    try:
-        if path.is_symlink() or not path.exists():
-            raise _credentials_error()
-        if not stat.S_ISREG(path.stat().st_mode):
-            raise _credentials_error()
-        with path.open("r", encoding="utf-8") as handle:
-            config = json.load(handle)
-    except AuthError:
-        raise
-    except (OSError, ValueError, TypeError) as exc:
-        raise _credentials_error() from exc
-
-    if (
-        not isinstance(config, dict)
-        or set(config) != {"username"}
-        or not isinstance(config["username"], str)
-    ):
+    config = _read_config()
+    if "username" not in config:
         raise _credentials_error()
 
     username = _validated_username(config["username"])
@@ -843,15 +914,12 @@ def submission_status(assignment: dict) -> str:
 
 
 
-def fetch_courses(page):
-    return paginated_get(
-        page,
-        "/api/v1/courses",
-        [
-            ("enrollment_state", "active"),
-            ("include[]", "term"),
-        ],
-    )
+def fetch_courses(page, *, student_only: bool = True):
+    params = [("enrollment_state", "active")]
+    if student_only:
+        params.append(("enrollment_type", "student"))
+    params.append(("include[]", "term"))
+    return paginated_get(page, "/api/v1/courses", params)
 
 
 def normalize_course_filters(values: list[str] | None) -> set[str]:
@@ -1461,9 +1529,12 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.command is not None:
-        if args.command != "auth" or args.action != "setup":
-            parser.error("the only supported subcommand is: canvas auth setup")
+    if args.command == "auth":
+        if args.action != "setup":
+            parser.error(
+                "supported commands: canvas auth setup; "
+                "canvas student on|off|status"
+            )
         try:
             return configure_auth()
         except KeyboardInterrupt:
@@ -1473,8 +1544,30 @@ def main():
             print(f"Error: {exc}", file=sys.stderr)
             return 1
 
-    if args.action is not None:
-        parser.error("the only supported subcommand is: canvas auth setup")
+    if args.command == "student":
+        if args.action not in STUDENT_MODE_COMMANDS:
+            parser.error(
+                "supported commands: canvas auth setup; "
+                "canvas student on|off|status"
+            )
+        try:
+            return student_mode_command(args.action)
+        except KeyboardInterrupt:
+            print("\nCancelled.", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if args.command is not None or args.action is not None:
+        parser.error(
+            "supported commands: canvas auth setup; "
+            "canvas student on|off|status"
+        )
+    try:
+        student_only = load_student_mode() == STUDENT_MODE_ON
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     try:
         days = normalize_days(args.days)
     except ValueError as exc:
@@ -1514,7 +1607,7 @@ def main():
                     "Loading Canvas courses",
                     "Canvas courses loaded.",
                 ):
-                    available_courses = fetch_courses(page)
+                    available_courses = fetch_courses(page, student_only=student_only)
                 terminal_session = (
                     _picker_terminal_session(sys.stdin, sys.stderr)
                     if interactive_course

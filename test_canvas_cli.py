@@ -188,6 +188,67 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(calls[0][4], "first")
         self.assertEqual(calls[2][4], "second")
 
+    def test_student_mode_defaults_to_on_without_config(self):
+        self.assertEqual(canvas.load_student_mode(), canvas.STUDENT_MODE_ON)
+
+    def test_student_mode_commands_persist_and_report_without_canvas_auth(self):
+        off_output = io.StringIO()
+        with (
+            mock.patch("sys.argv", ["canvas", "student", "off"]),
+            mock.patch.object(canvas, "sync_playwright") as playwright,
+            contextlib.redirect_stdout(off_output),
+        ):
+            self.assertEqual(canvas.main(), 0)
+
+        self.assertEqual(off_output.getvalue(), "Student mode set to off.\n")
+        self.assertEqual(canvas.load_student_mode(), canvas.STUDENT_MODE_OFF)
+        config_path = Path(self.config_root.name) / "canvas-cli/config.json"
+        self.assertEqual(
+            json.loads(config_path.read_text()),
+            {canvas.STUDENT_MODE_KEY: canvas.STUDENT_MODE_OFF},
+        )
+        playwright.assert_not_called()
+
+        status_output = io.StringIO()
+        with (
+            mock.patch("sys.argv", ["canvas", "student", "status"]),
+            contextlib.redirect_stdout(status_output),
+        ):
+            self.assertEqual(canvas.main(), 0)
+        self.assertEqual(status_output.getvalue(), "Student mode: off\n")
+
+        on_output = io.StringIO()
+        with (
+            mock.patch("sys.argv", ["canvas", "student", "on"]),
+            contextlib.redirect_stdout(on_output),
+        ):
+            self.assertEqual(canvas.main(), 0)
+        self.assertEqual(on_output.getvalue(), "Student mode set to on.\n")
+        self.assertEqual(canvas.load_student_mode(), canvas.STUDENT_MODE_ON)
+
+    def test_setup_preserves_student_mode(self):
+        config_path = Path(self.config_root.name) / "canvas-cli/config.json"
+        config_path.parent.mkdir(mode=0o700, exist_ok=True)
+        config_path.write_text('{"username":"first","student_mode":"off"}\n')
+        config_path.chmod(0o600)
+
+        def run(command, **kwargs):
+            if command[1] == "add-generic-password":
+                return self.completed(command)
+            return self.completed(command, stdout="pw\n")
+
+        with (
+            mock.patch.object(canvas.subprocess, "run", side_effect=run),
+            mock.patch("builtins.input", return_value="second"),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(canvas.configure_auth(), 0)
+
+        self.assertEqual(
+            json.loads(config_path.read_text()),
+            {"username": "second", "student_mode": "off"},
+        )
+
     def test_invalid_username_does_not_touch_keychain(self):
         with mock.patch("builtins.input", return_value="bad username"), mock.patch.object(
             canvas.subprocess, "run"
@@ -222,6 +283,48 @@ class CourseAndStatusTests(unittest.TestCase):
             {"id": 2, "course_code": "BIO101", "name": "Biology"},
             {"id": 1, "course_code": "NUR3145", "name": "Pharmacology"},
         ]
+        self.config_root = tempfile.TemporaryDirectory()
+        self.config_environment = mock.patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": self.config_root.name},
+            clear=False,
+        )
+        self.config_environment.start()
+
+    def tearDown(self):
+        self.config_environment.stop()
+        self.config_root.cleanup()
+
+    @mock.patch.object(canvas, "paginated_get")
+    def test_fetch_courses_requests_only_active_student_enrollments(self, paginated):
+        paginated.return_value = []
+        page = object()
+
+        self.assertEqual(canvas.fetch_courses(page), [])
+        paginated.assert_called_once_with(
+            page,
+            "/api/v1/courses",
+            [
+                ("enrollment_state", "active"),
+                ("enrollment_type", "student"),
+                ("include[]", "term"),
+            ],
+        )
+
+    @mock.patch.object(canvas, "paginated_get")
+    def test_fetch_courses_can_include_all_active_enrollment_types(self, paginated):
+        paginated.return_value = []
+        page = object()
+
+        self.assertEqual(canvas.fetch_courses(page, student_only=False), [])
+        paginated.assert_called_once_with(
+            page,
+            "/api/v1/courses",
+            [
+                ("enrollment_state", "active"),
+                ("include[]", "term"),
+            ],
+        )
 
     def test_course_filter_matches_code_or_name_case_insensitively(self):
         filters = canvas.normalize_course_filters([" nur3145 ", "biology"])
@@ -631,6 +734,33 @@ class CourseAndStatusTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.kwargs["courses"], [courses[0]])
         context.close.assert_called_once()
 
+    def test_main_uses_persisted_student_mode(self):
+        context = mock.Mock()
+        page = object()
+        context.pages = [page]
+        sync = mock.Mock()
+        sync.__enter__ = mock.Mock(return_value=object())
+        sync.__exit__ = mock.Mock(return_value=None)
+        courses = [
+            {"id": 1, "course_code": "NUR3145", "name": "Pharmacology"},
+        ]
+        canvas.set_student_mode(canvas.STUDENT_MODE_OFF)
+        with tempfile.TemporaryDirectory() as profile, mock.patch(
+            "sys.argv",
+            ["canvas", "--json"],
+        ), mock.patch.object(canvas, "PROFILE_DIR", Path(profile)), mock.patch.object(
+            canvas, "sync_playwright", return_value=sync
+        ), mock.patch.object(canvas, "launch_context", return_value=context), mock.patch.object(
+            canvas, "ensure_login"
+        ), mock.patch.object(
+            canvas, "fetch_courses", return_value=courses
+        ) as fetch_courses, mock.patch.object(canvas, "fetch_assignments", return_value=[]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(canvas.main(), 0)
+
+        fetch_courses.assert_called_once_with(page, student_only=False)
+        context.close.assert_called_once()
+
     def test_main_lists_filtered_courses_as_json(self):
         context = mock.Mock()
         context.pages = [object()]
@@ -912,6 +1042,17 @@ class ShortenTests(unittest.TestCase):
             "url": "https://ufl.instructure.com/courses/1/assignments/2",
             "submission_status": "unsubmitted",
         }
+        self.config_root = tempfile.TemporaryDirectory()
+        self.config_environment = mock.patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": self.config_root.name},
+            clear=False,
+        )
+        self.config_environment.start()
+
+    def tearDown(self):
+        self.config_environment.stop()
+        self.config_root.cleanup()
 
     def test_shorten_rows_omits_instructions_and_submission_status(self):
         shortened = canvas.shorten_rows([self.row])
