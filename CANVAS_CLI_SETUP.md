@@ -60,14 +60,22 @@ Push and prints:
 
 ```text
 Duo Push sent; approve it in Duo Mobile.
+Duo verification code: 455; enter it in Duo Mobile.
+Duo verification succeeded.
 ```
 
-Approve that notification in Duo Mobile. The CLI waits up to 180 seconds,
-then verifies the authenticated Canvas API session and fetches assignments
-in the same headless browser context. It never opens a headed browser,
-requests passcodes or calls, or retries the primary password or push.
+For UF Verified Duo Push, the second line contains the three-digit code
+currently shown by the headless login page. Enter that exact code in the
+Duo Mobile notification. The CLI waits up to 180 seconds, then verifies
+the authenticated Canvas API session and fetches assignments in the same
+headless browser context. It never opens a headed browser, requests
+passcodes or calls, or retries the primary password or push.
 Missing credentials, a rejected password, or an unavailable Duo Push
 returns a setup/authentication error instead.
+
+The terminal also shows a live loading bar during authentication,
+course loading, and assignment loading. Status messages are written to
+stderr, so `--json` output remains valid JSON on stdout.
 
 ---
 

@@ -40,6 +40,7 @@ import sys
 import tempfile
 import termios
 import time
+import threading
 import tty
 import unicodedata
 from dataclasses import dataclass
@@ -83,6 +84,116 @@ class Credentials:
 
 class AuthError(RuntimeError):
     pass
+
+
+class _TerminalLoadingBar:
+    _FRAMES = (
+        "[>         ]",
+        "[=>        ]",
+        "[==>       ]",
+        "[===>      ]",
+        "[ ===>     ]",
+        "[  ===>    ]",
+        "[   ===>   ]",
+        "[    ===>  ]",
+        "[     ===> ]",
+        "[      ===>]",
+    )
+
+    def __init__(self, stream, label: str):
+        self._stream = stream
+        self._label = label
+        try:
+            self._is_tty = stream.isatty()
+        except Exception:
+            self._is_tty = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._frame = 0
+        self._running = False
+        self._stopped = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        message = (
+            f"{self._label} failed."
+            if exc_type is not None
+            else f"{self._label} ready."
+        )
+        self.stop(message)
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        with self._lock:
+            if self._is_tty:
+                self._render_locked()
+            else:
+                self._stream.write(f"{self._label} {self._FRAMES[0]}\n")
+            self._stream.flush()
+        if self._is_tty:
+            self._thread = threading.Thread(
+                target=self._animate,
+                name="canvas-loading-bar",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _render_locked(self) -> None:
+        frame = self._FRAMES[self._frame % len(self._FRAMES)]
+        self._frame += 1
+        self._stream.write(f"\r\x1b[2K{self._label} {frame}")
+
+    def _animate(self) -> None:
+        while not self._stop_event.wait(0.12):
+            with self._lock:
+                if not self._running:
+                    return
+                self._render_locked()
+                self._stream.flush()
+
+    def message(self, message: str) -> None:
+        with self._lock:
+            if self._is_tty:
+                self._stream.write("\r\x1b[2K")
+            self._stream.write(f"{message}\n")
+            if self._running and self._is_tty:
+                self._render_locked()
+            self._stream.flush()
+
+    def stop(self, message: str) -> None:
+        if not self._running and self._stopped:
+            return
+        self._running = False
+        self._stop_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join()
+        with self._lock:
+            if self._stopped:
+                return
+            if self._is_tty:
+                self._stream.write("\r\x1b[2K")
+            self._stream.write(f"{message}\n")
+            self._stream.flush()
+            self._stopped = True
+
+
+@contextlib.contextmanager
+def _loading_bar(stream, label: str, success_message: str):
+    progress = _TerminalLoadingBar(stream, label)
+    progress.start()
+    try:
+        yield progress
+    except BaseException:
+        progress.stop(f"{label} failed.")
+        raise
+    else:
+        progress.stop(success_message)
 
 
 def _credentials_error() -> AuthError:
@@ -521,6 +632,8 @@ DUO_PUSH_CONTROL = re.compile(
     r"|verify with duo push",
     re.IGNORECASE,
 )
+DUO_VERIFICATION_CODE = re.compile(r"\b\d{3}\b")
+DUO_CODE_CONTEXT = re.compile(r"\b(?:code|number|verification)\b", re.IGNORECASE)
 OTHER_OPTIONS_CONTROL = re.compile(r"other options", re.IGNORECASE)
 LOGIN_LOADING = re.compile(
     r"loading (?:login )?session information|automatically redirected",
@@ -620,11 +733,39 @@ def _duo_prompt_visible(page) -> bool:
     )
 
 
-def _wait_for_duo_approval(page) -> bool:
+def _duo_verification_code(page) -> str | None:
+    for surface in _auth_surfaces(page):
+        text = _surface_text(surface)
+        if not text:
+            continue
+        for match in DUO_VERIFICATION_CODE.finditer(text):
+            context_start = max(0, match.start() - 120)
+            context_end = min(len(text), match.end() + 80)
+            if DUO_CODE_CONTEXT.search(text[context_start:context_end]):
+                return match.group()
+    return None
+
+
+def _auth_message(message: str, progress=None) -> None:
+    if progress is None:
+        print(message, file=sys.stderr, flush=True)
+    else:
+        progress.message(message)
+
+
+def _wait_for_duo_approval(page, progress=None) -> bool:
     deadline = time.monotonic() + DUO_TIMEOUT_SECONDS
+    displayed_code = None
     while time.monotonic() < deadline:
         if page.is_closed():
             raise RuntimeError("Duo approval was not completed within 180 seconds.")
+        code = _duo_verification_code(page)
+        if code and code != displayed_code:
+            _auth_message(
+                f"Duo verification code: {code}; enter it in Duo Mobile.",
+                progress,
+            )
+            displayed_code = code
         if page.url.startswith(BASE_URL) and is_logged_in(page):
             return True
         time.sleep(1)
@@ -632,8 +773,8 @@ def _wait_for_duo_approval(page) -> bool:
     raise RuntimeError("Duo approval was not completed within 180 seconds.")
 
 
-def ensure_login(page) -> bool:
-    response = page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
+def ensure_login(page, progress=None) -> bool:
+    response = page.goto(PROFILE_URL, wait_until="commit", timeout=60_000)
     if response is not None and response.status == 200:
         try:
             profile = json.loads(response.text())
@@ -641,9 +782,9 @@ def ensure_login(page) -> bool:
                 return True
         except Exception:
             pass
-    if is_logged_in(page):
-        return True
-
+    if response is None or response.status != 401:
+        if is_logged_in(page):
+            return True
     credentials = load_credentials()
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
     fill_primary_credentials(page, credentials)
@@ -663,8 +804,10 @@ def ensure_login(page) -> bool:
             push_checked = True
             if not request_duo_push(page):
                 raise RuntimeError("Duo Push is not available for this account.")
-            print("Duo Push sent; approve it in Duo Mobile.", file=sys.stderr)
-            return _wait_for_duo_approval(page)
+            _auth_message("Duo Push sent; approve it in Duo Mobile.", progress)
+            _wait_for_duo_approval(page, progress=progress)
+            _auth_message("Duo verification succeeded.", progress)
+            return True
         time.sleep(0.25)
 
     if _page_has_text(page, PRIMARY_AUTH_FAILURE):
@@ -676,8 +819,10 @@ def ensure_login(page) -> bool:
     if not push_checked:
         push_checked = True
         if request_duo_push(page):
-            print("Duo Push sent; approve it in Duo Mobile.", file=sys.stderr)
-            return _wait_for_duo_approval(page)
+            _auth_message("Duo Push sent; approve it in Duo Mobile.", progress)
+            _wait_for_duo_approval(page, progress=progress)
+            _auth_message("Duo verification succeeded.", progress)
+            return True
     raise RuntimeError("Duo Push is not available for this account.")
 
 
@@ -750,7 +895,6 @@ def filter_courses(courses: list[dict], filters: set[str]) -> list[dict]:
 
 
 STATUS_FILTERS = ("unsubmitted", "submitted", "graded", "all")
-
 
 def normalize_status_filter(value: str) -> str:
     normalized = value.strip().casefold()
@@ -1152,6 +1296,7 @@ def fetch_assignments(
     tz: ZoneInfo = ZoneInfo("America/New_York"),
     courses: list[dict] | None = None,
     status_filter: str = "unsubmitted",
+    progress=None,
 ):
     courses = fetch_courses(page) if courses is None else courses
     status_filter = normalize_status_filter(status_filter)
@@ -1176,7 +1321,7 @@ def fetch_assignments(
         res = batch_map.get(course_id)
         if not res or not res.get("ok"):
             err_msg = res.get("error") if res else "No response returned"
-            print(f"Warning: skipped {course_name}: {err_msg}", file=sys.stderr)
+            _auth_message(f"Warning: skipped {course_name}: {err_msg}", progress)
             continue
 
         assignments = res.get("items") or []
@@ -1358,8 +1503,18 @@ def main():
             context = launch_context(p)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                ensure_login(page)
-                available_courses = fetch_courses(page)
+                with _loading_bar(
+                    sys.stderr,
+                    "Authenticating with UF",
+                    "Canvas authentication ready.",
+                ) as auth_progress:
+                    ensure_login(page, progress=auth_progress)
+                with _loading_bar(
+                    sys.stderr,
+                    "Loading Canvas courses",
+                    "Canvas courses loaded.",
+                ):
+                    available_courses = fetch_courses(page)
                 terminal_session = (
                     _picker_terminal_session(sys.stdin, sys.stderr)
                     if interactive_course
@@ -1384,13 +1539,18 @@ def main():
                             )
                         ]
                     else:
-                        rows = fetch_assignments(
-                            page,
-                            days,
-                            tz,
-                            courses=courses,
-                            status_filter=args.status,
-                        )
+                        with _loading_bar(
+                            sys.stderr,
+                            "Loading Canvas assignments",
+                            "Canvas assignments loaded.",
+                        ) as assignments_progress:
+                            rows = fetch_assignments(
+                                page,
+                                days,
+                                tz,
+                                courses=courses,
+                                status_filter=args.status,
+                            )
                     if interactive_course:
                         _flush_terminal_input(sys.stdin)
             finally:

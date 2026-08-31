@@ -269,6 +269,53 @@ class CourseAndStatusTests(unittest.TestCase):
         self.assertIn("Loading Canvas data...", loading_screen)
         self.assertIn("Processing 1 selected course.", loading_screen)
 
+    def test_loading_bar_reports_progress_lifecycle(self):
+        output = io.StringIO()
+
+        with canvas._loading_bar(
+            output,
+            "Loading Canvas assignments",
+            "Canvas assignments loaded.",
+        ) as progress:
+            progress.message("Duo verification succeeded.")
+
+        rendered = output.getvalue()
+        self.assertIn("Loading Canvas assignments [>", rendered)
+        self.assertIn("Duo verification succeeded.", rendered)
+        self.assertIn("Canvas assignments loaded.", rendered)
+
+    def test_loading_bar_uses_tty_updates_and_preserves_messages(self):
+        master, slave = pty.openpty()
+        output = os.fdopen(
+            os.dup(slave),
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+        try:
+            with canvas._loading_bar(
+                output,
+                "Loading Canvas assignments",
+                "Canvas assignments loaded.",
+            ) as progress:
+                canvas.time.sleep(0.15)
+                progress.message("Duo verification succeeded.")
+            output.close()
+            rendered = os.read(master, 65536).decode("utf-8")
+            os.close(slave)
+        finally:
+            if not output.closed:
+                output.close()
+            try:
+                os.close(slave)
+            except OSError:
+                pass
+            os.close(master)
+
+        self.assertIn("\x1b[2KLoading Canvas assignments", rendered)
+        self.assertIn("Duo verification succeeded.", rendered)
+        self.assertIn("Canvas assignments loaded.", rendered)
+
     def test_interactive_course_picker_defaults_ui_to_stderr(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -563,7 +610,14 @@ class CourseAndStatusTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as profile, mock.patch(
             "sys.argv",
-            ["canvas", "--course", "nur3145", "--status", "submitted", "--json"],
+            [
+                "canvas",
+                "--course",
+                "nur3145",
+                "--status",
+                "submitted",
+                "--json",
+            ],
         ), mock.patch.object(canvas, "PROFILE_DIR", Path(profile)), mock.patch.object(
             canvas, "sync_playwright", return_value=sync
         ), mock.patch.object(canvas, "launch_context", return_value=context), mock.patch.object(
@@ -709,6 +763,7 @@ class CourseAndStatusTests(unittest.TestCase):
 
         self.assertEqual(events, ["enter", "select", "fetch", "exit"])
         self.assertEqual(json.loads(stdout.getvalue()), [assignment])
+        self.assertNotIn("Starting Canvas browser", stderr.getvalue())
     def test_normalize_days_handles_default_integer_and_all(self):
         self.assertEqual(canvas.normalize_days(None), 14)
         self.assertEqual(canvas.normalize_days("all"), 0)
@@ -941,6 +996,50 @@ class AuthenticationLogicTests(unittest.TestCase):
         password.fill.assert_called_once_with("secret")
         submit.click.assert_called_once_with()
 
+    def test_ensure_login_uses_duo_prompt_helper(self):
+        page = mock.Mock()
+        profile_response = mock.Mock(status=401)
+        page.goto.side_effect = [profile_response, None]
+        page.url = "https://login.ufl.edu/"
+        page.is_closed.return_value = False
+
+        with (
+            mock.patch.object(canvas, "is_logged_in", return_value=False),
+            mock.patch.object(canvas, "_page_has_text", return_value=False),
+            mock.patch.object(
+                canvas,
+                "load_credentials",
+                return_value=canvas.Credentials("gator123", "secret"),
+            ),
+            mock.patch.object(canvas, "fill_primary_credentials"),
+            mock.patch.object(canvas, "_duo_prompt_visible", return_value=True) as prompt,
+            mock.patch.object(canvas, "request_duo_push", return_value=True) as push,
+            mock.patch.object(canvas, "_wait_for_duo_approval", return_value=True) as wait,
+            mock.patch.object(canvas.time, "monotonic", return_value=0),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertTrue(canvas.ensure_login(page))
+
+        prompt.assert_called_once_with(page)
+        push.assert_called_once_with(page)
+        wait.assert_called_once_with(page, progress=None)
+        self.assertIn("Duo verification succeeded.", stderr.getvalue())
+
+    def test_ensure_login_uses_commit_for_valid_session_probe(self):
+        page = mock.Mock()
+        response = mock.Mock(status=200)
+        response.text.return_value = json.dumps({"id": 42})
+        page.goto.return_value = response
+
+        self.assertTrue(canvas.ensure_login(page))
+
+        page.goto.assert_called_once_with(
+            canvas.PROFILE_URL,
+            wait_until="commit",
+            timeout=60_000,
+        )
+
+
 
 class BrowserFixtureTests(unittest.TestCase):
     @classmethod
@@ -1077,6 +1176,28 @@ class BrowserFixtureTests(unittest.TestCase):
             "<iframe srcdoc=\"<p>We've sent a notification</p>\"></iframe>"
         )
         self.assertTrue(canvas.request_duo_push(self.page))
+
+    def test_duo_verified_push_code_is_displayed_for_mobile_entry(self):
+        page = mock.Mock()
+        page.frames = []
+        page.url = canvas.BASE_URL + "/login"
+        page.is_closed.return_value = False
+        page.locator.return_value.inner_text.return_value = (
+            "Approve the login request\n"
+            "Enter the 3-digit code into Duo Mobile:\n"
+            "042"
+        )
+
+        with (
+            mock.patch.object(canvas, "is_logged_in", side_effect=[False, True]),
+            mock.patch.object(canvas.time, "monotonic", side_effect=[0, 1, 2]),
+            mock.patch.object(canvas.time, "sleep"),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertTrue(canvas._wait_for_duo_approval(page))
+
+        self.assertIn("Duo verification code: 042; enter it in Duo Mobile.", stderr.getvalue())
+
 
 
     def test_batch_fetch_course_assignments_retries_on_rate_limit_and_succeeds(self):
