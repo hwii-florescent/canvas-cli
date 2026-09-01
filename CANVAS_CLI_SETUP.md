@@ -8,8 +8,10 @@ We created a simple local CLI tool for UF Canvas so agents can fetch:
 - Course name
 - Due date
 - Assignment instructions
+- Attached Canvas file metadata
 - Submission status
 - Assignment URL
+- File submission support for online-upload assignments
 
 The goal was to keep the setup simple and avoid building a full MCP server, database, or background polling system.
 
@@ -23,7 +25,9 @@ We created a command-line tool called:
 canvas
 ```
 
-The CLI uses a saved UF Canvas browser session and makes read-only Canvas API requests from that authenticated session.
+The CLI uses a saved UF Canvas browser session for read-only Canvas API
+requests, authenticated file downloads, and explicitly confirmed file
+submissions.
 
 This avoids needing a Canvas API token.
 
@@ -286,7 +290,90 @@ canvas --status all
 `--status all` includes every status returned by Canvas, including
 `submitted`, `graded`, `missing`, `late`, and `unsubmitted`.
 
+### Explore course navigation
+
+List the sections available in a course, including their clickable Canvas URLs:
+
+```bash
+canvas course 574892
+canvas course 574892 --json
+```
+
+The navigation response is course- and user-specific. It contains only the
+sections Canvas exposes for that course, so a course without Files, Grades, or
+another feature will not list that section. Common sections include Home,
+Announcements, Assignments, Discussions, Modules, Pages, and course-specific
+tools. External links are displayed but are not fetched by the CLI.
+
+### Read a specific Canvas resource or course section
+
+Use `canvas fetch` with a Canvas URL when you need one resource instead of the
+upcoming-assignment list:
+
+```bash
+canvas fetch https://ufl.instructure.com/courses/570905/quizzes/1650213
+canvas fetch https://ufl.instructure.com/courses/574892/pages/project-setup-intellij-slash-gradle
+canvas fetch https://ufl.instructure.com/courses/575787/files
+canvas fetch https://ufl.instructure.com/courses/574892/announcements
+```
+
+Assignment, quiz, page, and file URLs use Canvas's authenticated APIs. Other
+same-host URLs under `/courses/COURSE_ID/`, including announcements, home,
+modules, discussions, and grades, are opened in the authenticated headless
+browser and converted to readable text. This remains read-only.
+
+Download those attached Canvas files to a local directory with:
+
+```bash
+canvas fetch \
+  https://ufl.instructure.com/courses/570905/quizzes/1650213 \
+  --download-dir ./canvas-files \
+  --json
+```
+
+The download uses the authenticated browser session and only performs
+read-only `GET` requests against `ufl.instructure.com`; it does not submit or
+modify anything in Canvas. `--download-dir` also works with ordinary
+assignment-list commands, fetched pages/sections, and course `/files` URLs.
+For a file listing, each listed file is downloaded. External links are
+displayed but are not downloaded. If filenames collide, a numeric suffix such
+as `(2)` is added instead of overwriting an existing file.
+
+### Submit files to an assignment
+
+The CLI supports Canvas `online_upload` submissions only. It does not submit
+text, URLs, or other submission formats.
+
+Preview a file submission without uploading or changing Canvas:
+
+```bash
+canvas submit \
+  https://ufl.instructure.com/courses/570905/assignments/123456 \
+  --file ./report.pdf \
+  --dry-run \
+  --json
+```
+
+Submit one or more files:
+
+```bash
+canvas submit \
+  https://ufl.instructure.com/courses/570905/assignments/123456 \
+  --file ./report.pdf
+```
+
+Repeat `--file` for additional files. Before any upload, the CLI validates
+that the local files exist, the assignment accepts file uploads, and the file
+extensions are allowed. It then displays the exact assignment and files and
+requires typing `SUBMIT`. No Canvas write request occurs before that
+confirmation.
+
+Quiz URLs are rejected by `canvas submit`. The CLI can read quiz instructions
+and download quiz attachments, but it does not start or answer quizzes. Use
+the Canvas quiz page in Chrome/Chromium for that workflow.
+
 ---
+
 
 ### JSON output
 
@@ -307,9 +394,9 @@ Example:
     "due_at": "2026-09-01T23:59:00-04:00",
     "due_display": "Tue, Sep 01, 2026 at 11:59 PM EDT",
     "instructions": "Complete Chapters 1-3...",
+    "attachments": [],
     "url": "https://ufl.instructure.com/courses/...",
     "submission_status": "unsubmitted"
-  }
 ]
 ```
 
@@ -326,8 +413,9 @@ canvas --shorten --json
 ```
 
 This omits `instructions` and `submission_status` from both human-readable and
-JSON assignment output. The remaining course, title, due-date, and URL fields
-are unchanged. Combine it with `--course`, `--status`, and `--days` as needed.
+JSON assignment output. The remaining course, title, due-date, URL, and
+attachments fields are unchanged. Combine it with `--course`, `--status`, and
+`--days` as needed.
 
 ---
 
@@ -409,7 +497,7 @@ Saved Chromium Canvas login
 UF Canvas
       |
       v
-Read-only Canvas API requests
+Read-only Canvas API requests, authenticated downloads, and confirmed file submissions
 ```
 
 There is currently:

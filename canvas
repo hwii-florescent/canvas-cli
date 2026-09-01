@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-canvas.py — headless UF Canvas assignment fetcher
+canvas.py — headless UF Canvas course resource reader
 
 What it does:
 - Reuses a persistent Chromium session for https://ufl.instructure.com
 - Automates UF primary login with a local username and macOS Keychain password
 - Requests one Duo Push for the user to approve in Duo Mobile when required
-- Uses Canvas's read-only API through that authenticated browser session
-- Prints assignment name, course, due date, instructions, URL, and submission status
-- Supports --json for use by agents
+- Uses Canvas's read-only APIs and authenticated browser pages for reads
+- Lists course navigation sections and their clickable Canvas URLs
+- Reads assignments, quizzes, pages, files, and other course sections
+- Can download Canvas files without modifying Canvas
+- Can submit local files to online-upload assignments after confirmation
 
 Install:
     python3 -m pip install playwright
@@ -20,6 +22,13 @@ Usage:
     python3 canvas.py student off
     python3 canvas.py student on
     python3 canvas.py student status
+    python3 canvas.py fetch https://ufl.instructure.com/courses/1/quizzes/2
+    python3 canvas.py fetch https://ufl.instructure.com/courses/1/quizzes/2 --download-dir ./files
+    python3 canvas.py course 1
+    python3 canvas.py fetch https://ufl.instructure.com/courses/1/pages/setup
+    python3 canvas.py fetch https://ufl.instructure.com/courses/1/files --download-dir ./files
+    python3 canvas.py fetch https://ufl.instructure.com/courses/1/announcements
+    python3 canvas.py submit https://ufl.instructure.com/courses/1/assignments/2 --file ./report.pdf
     python3 canvas.py --course NUR3145
     python3 canvas.py --course
     python3 canvas.py --list-courses --json
@@ -28,12 +37,11 @@ Usage:
     python3 canvas.py --days all     # all future assignments and assignments without due dates
 """
 
-from __future__ import annotations
-
 import argparse
 import contextlib
 import html
 import json
+import mimetypes
 import os
 import re
 import select
@@ -50,11 +58,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import FormData, sync_playwright
 except ImportError:
     print(
         "Missing dependency: playwright\n\n"
@@ -82,6 +90,30 @@ STUDENT_MODE_ON = "on"
 STUDENT_MODE_OFF = "off"
 STUDENT_MODES = (STUDENT_MODE_ON, STUDENT_MODE_OFF)
 STUDENT_MODE_COMMANDS = (*STUDENT_MODES, "status")
+
+CANVAS_HOST = urlsplit(BASE_URL).hostname or ""
+_TARGET_PATH_RE = re.compile(
+    r"^/courses/(?P<course_id>\d+)/"
+    r"(?P<resource_type>assignments|quizzes)/"
+    r"(?P<resource_id>\d+)/?$"
+)
+_PAGE_PATH_RE = re.compile(
+    r"^/courses/(?P<course_id>\d+)/pages"
+    r"(?:/(?P<page_url>[^/]+))?/?$"
+)
+_COURSE_FILES_PATH_RE = re.compile(
+    r"^/courses/(?P<course_id>\d+)/files/?$"
+)
+_COURSE_FILE_PATH_RE = re.compile(
+    r"^/courses/(?P<course_id>\d+)/files/(?P<file_id>\d+)/?$"
+)
+_COURSE_PATH_RE = re.compile(
+    r"^/courses/(?P<course_id>\d+)(?:/|$)"
+)
+_FILE_PATH_RE = re.compile(
+    r"^(?:/[^/]+)*/files/(?P<file_id>\d+)"
+    r"(?P<suffix>/(?:download|preview))?/?$"
+)
 
 
 @dataclass(frozen=True)
@@ -482,6 +514,221 @@ def html_to_text(value: str | None) -> str:
         return re.sub(r"<[^>]+>", "", html.unescape(value)).strip()
 
 
+class _AttachmentParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.attachments: list[dict] = []
+        self._anchor: dict | None = None
+
+    def _finish_anchor(self) -> None:
+        if self._anchor is not None:
+            self.attachments.append(self._anchor)
+            self._anchor = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "a":
+            if self._anchor is not None:
+                return
+            attributes = dict(attrs)
+            href = attributes.get("href")
+            if not href:
+                return
+            label = (
+                attributes.get("download")
+                or attributes.get("data-file-name")
+                or attributes.get("title")
+                or attributes.get("aria-label")
+                or ""
+            )
+            self._anchor = {
+                "href": href,
+                "label": label,
+                "parts": [],
+            }
+        elif self._anchor is not None and tag in {"img", "input"}:
+            attributes = dict(attrs)
+            alt = attributes.get("alt")
+            if alt:
+                self._anchor["parts"].append(alt)
+
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._anchor["parts"].append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a":
+            self._finish_anchor()
+
+    def close(self):
+        super().close()
+        self._finish_anchor()
+
+
+def _canvas_file_download_url(href: str | None) -> tuple[int, str] | None:
+    if not href or not isinstance(href, str):
+        return None
+
+    absolute = urljoin(BASE_URL + "/", href.strip())
+    parsed = urlsplit(absolute)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != CANVAS_HOST.casefold()
+        or parsed.path.startswith("/api/")
+    ):
+        return None
+
+    match = _FILE_PATH_RE.match(parsed.path)
+    if not match:
+        return None
+
+    path = parsed.path.rstrip("/")
+    if path.endswith("/preview"):
+        path = path[:-len("/preview")]
+    if not path.endswith("/download"):
+        path += "/download"
+    return (
+        int(match.group("file_id")),
+        urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, "")),
+    )
+
+
+def _normalize_attachment_label(value: str | None) -> str:
+    return re.sub(r"\s+", " ", html.unescape(value or "")).strip()
+
+
+def extract_attachments(value: str | None) -> list[dict]:
+    if not value:
+        return []
+
+    parser = _AttachmentParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return []
+
+    attachments = []
+    seen = set()
+    for candidate in parser.attachments:
+        resolved = _canvas_file_download_url(candidate.get("href"))
+        if resolved is None:
+            continue
+        file_id, download_url = resolved
+        key = (file_id, download_url)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = _normalize_attachment_label(
+            "".join(candidate.get("parts") or [])
+        )
+        if not label:
+            label = _normalize_attachment_label(candidate.get("label"))
+        if not label:
+            label = f"file-{file_id}"
+        attachments.append(
+            {
+                "name": label,
+                "file_id": file_id,
+                "url": download_url,
+            }
+        )
+    return attachments
+
+
+def validate_canvas_course_url(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            "Canvas URL must be an https://ufl.instructure.com/courses/ URL."
+        )
+    target_url = value.strip()
+    parsed = urlsplit(target_url)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != CANVAS_HOST.casefold()
+    ):
+        raise ValueError(
+            "Canvas URL must use https://ufl.instructure.com."
+        )
+    if not _COURSE_PATH_RE.match(parsed.path):
+        raise ValueError(
+            "Canvas URL must identify a Canvas course path under "
+            "https://ufl.instructure.com/courses/."
+        )
+    return target_url
+
+
+def _parse_canvas_resource_url(value: str) -> tuple[str, int, str | int | None]:
+    if not isinstance(value, str):
+        raise ValueError(
+            "Canvas URL must look like "
+            "https://ufl.instructure.com/courses/COURSE_ID/"
+            "assignments|quizzes/ID, pages[/PAGE_URL], or files[/FILE_ID]"
+        )
+
+    parsed = urlsplit(value.strip())
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != CANVAS_HOST.casefold()
+    ):
+        raise ValueError(
+            "Canvas URL must use https://ufl.instructure.com."
+        )
+
+    match = _TARGET_PATH_RE.match(parsed.path)
+    if match:
+        return (
+            match.group("resource_type"),
+            int(match.group("course_id")),
+            int(match.group("resource_id")),
+        )
+
+    match = _PAGE_PATH_RE.match(parsed.path)
+    if match:
+        page_url = match.group("page_url")
+        return (
+            "pages",
+            int(match.group("course_id")),
+            unquote(page_url) if page_url else None,
+        )
+
+    match = _COURSE_FILES_PATH_RE.match(parsed.path)
+    if match:
+        return "files", int(match.group("course_id")), None
+
+    match = _COURSE_FILE_PATH_RE.match(parsed.path)
+    if match:
+        return (
+            "files",
+            int(match.group("course_id")),
+            int(match.group("file_id")),
+        )
+
+    raise ValueError(
+        "Canvas URL must look like "
+        "https://ufl.instructure.com/courses/COURSE_ID/"
+        "assignments|quizzes/ID, pages[/PAGE_URL], or files[/FILE_ID]"
+    )
+
+
+def parse_canvas_resource_url(
+    value: str,
+) -> tuple[str, int, str | int | None]:
+    return _parse_canvas_resource_url(value)
+
+
+def parse_canvas_target_url(value: str) -> tuple[str, int, int]:
+    resource_type, course_id, resource_id = _parse_canvas_resource_url(value)
+    if resource_type not in {"assignments", "quizzes"}:
+        raise ValueError(
+            "Canvas URL must look like "
+            "https://ufl.instructure.com/courses/COURSE_ID/"
+            "assignments|quizzes/ID"
+        )
+    return resource_type, course_id, int(resource_id)
+
+
 def parse_canvas_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -552,6 +799,75 @@ def api_get(page, path: str, params: list[tuple[str, str]] | None = None):
 
 
 
+def _request_client(page):
+    request = getattr(getattr(page, "context", None), "request", None)
+    if request is None:
+        raise RuntimeError("the authenticated browser context has no request client")
+    return request
+
+
+def _csrf_headers(page) -> dict[str, str]:
+    context = getattr(page, "context", None)
+    try:
+        cookies = context.cookies() if context is not None else []
+    except Exception:
+        return {}
+    if not isinstance(cookies, list):
+        return {}
+
+    canvas_host = CANVAS_HOST.casefold()
+    for cookie in cookies:
+        if not isinstance(cookie, dict) or cookie.get("name") != "_csrf_token":
+            continue
+        domain = str(cookie.get("domain") or "").lstrip(".").casefold()
+        if domain and not (
+            canvas_host == domain or canvas_host.endswith(f".{domain}")
+        ):
+            continue
+        value = cookie.get("value")
+        if isinstance(value, str) and value:
+            return {"X-CSRF-Token": unquote(value)}
+    return {}
+
+
+def _response_text(response) -> str:
+    try:
+        return str(response.text() or "")
+    except Exception:
+        return ""
+
+
+def _response_json(response, path: str):
+    text = _response_text(response)
+    if not response.ok:
+        raise RuntimeError(
+            f"Canvas API request failed ({response.status}): {path}\n"
+            f"{text[:500]}"
+        )
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Canvas returned a non-JSON response for {path}."
+        ) from exc
+
+
+def api_post(page, path: str, *, form=None, multipart=None):
+    if (form is None) == (multipart is None):
+        raise ValueError("provide exactly one POST body")
+    request = _request_client(page)
+    options = {
+        "headers": {"Accept": "application/json", **_csrf_headers(page)},
+        "timeout": 60_000,
+    }
+    if form is not None:
+        options["form"] = form
+    else:
+        options["multipart"] = multipart
+    response = request.post(BASE_URL + path, **options)
+    return _response_json(response, path)
+
+
 def paginated_get(page, path: str, params: list[tuple[str, str]] | None = None):
     params = list(params or [])
     out = []
@@ -573,6 +889,116 @@ def paginated_get(page, path: str, params: list[tuple[str, str]] | None = None):
             return out
 
         page_number += 1
+
+
+def _safe_attachment_filename(name: str | None, file_id: int) -> str:
+    filename = _normalize_attachment_label(name)
+    filename = unquote(filename)
+    filename = re.sub(r"[\x00-\x1f\x7f]", "_", filename)
+    filename = filename.replace("/", "_").replace("\\", "_").strip()
+    if not filename or filename in {".", ".."}:
+        return f"file-{file_id}"
+    return filename
+
+
+def _available_download_path(directory: Path, filename: str) -> Path:
+    candidate = directory / filename
+    if not candidate.exists() and not candidate.is_symlink():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        candidate = directory / f"{stem} ({counter}){suffix}"
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+        counter += 1
+
+
+def download_attachment(
+    page,
+    attachment: dict,
+    directory: str | Path,
+) -> Path:
+    resolved = _canvas_file_download_url(attachment.get("url"))
+    if resolved is None:
+        raise RuntimeError("attachment URL is not a UF Canvas file URL")
+    _, download_url = resolved
+
+    download_directory = Path(directory).expanduser()
+    download_directory.mkdir(parents=True, exist_ok=True)
+    file_id = int(attachment.get("file_id") or resolved[0])
+    filename = _safe_attachment_filename(attachment.get("name"), file_id)
+    destination = _available_download_path(download_directory, filename)
+
+    request = _request_client(page)
+
+    response = request.get(download_url, timeout=60_000)
+    if not response.ok:
+        raise RuntimeError(
+            f"Canvas file request failed ({response.status}): {download_url}"
+        )
+    body = response.body()
+    if not isinstance(body, (bytes, bytearray)):
+        raise RuntimeError("Canvas returned an invalid file response")
+
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".canvas-download-",
+            dir=str(download_directory),
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(body)
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+    return destination
+
+
+def download_attachments(page, rows: list[dict], directory, progress=None):
+    for row in rows:
+        for attachment in row.get("attachments") or []:
+            name = attachment.get("name") or "unnamed file"
+            try:
+                destination = download_attachment(page, attachment, directory)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to download Canvas attachment {name!r}: {exc}"
+                ) from exc
+            attachment["local_path"] = str(destination)
+            if progress is not None:
+                progress.message(f"Downloaded {name!r} to {destination}")
+    return rows
+
+def download_files(page, rows: list[dict], directory, progress=None):
+    for row in rows:
+        name = row.get("name") or row.get("title") or "unnamed file"
+        attachment = {
+            "name": name,
+            "file_id": row.get("id"),
+            "url": row.get("url"),
+        }
+        try:
+            destination = download_attachment(page, attachment, directory)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to download Canvas file {name!r}: {exc}"
+            ) from exc
+        row["local_path"] = str(destination)
+        if progress is not None:
+            progress.message(f"Downloaded {name!r} to {destination}")
+    return rows
+
+
 def is_logged_in(page) -> bool:
     result = _api_response(page, "/api/v1/users/self/profile")
     if result.get("status") == 401:
@@ -1007,6 +1433,85 @@ def print_courses(courses: list[dict]) -> None:
         print(f"{index}. {course_label(course)}")
 
 
+def parse_course_id(value: str) -> int:
+    if not isinstance(value, str) or not value.strip().isdigit():
+        raise ValueError("course ID must be a positive integer")
+    course_id = int(value.strip())
+    if course_id <= 0:
+        raise ValueError("course ID must be a positive integer")
+    return course_id
+
+
+def _canvas_link_url(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    return urljoin(BASE_URL + "/", value.strip())
+
+
+def fetch_course_navigation(
+    page,
+    course_id: int,
+    courses: list[dict] | None = None,
+) -> dict:
+    tabs = paginated_get(page, f"/api/v1/courses/{course_id}/tabs")
+    if not isinstance(tabs, list):
+        raise RuntimeError("Canvas returned an invalid course navigation response")
+    if any(not isinstance(tab, dict) for tab in tabs):
+        raise RuntimeError("Canvas returned an invalid course navigation item")
+
+    courses = fetch_courses(page) if courses is None else courses
+    course = _course_for_id(courses, course_id)
+    sections = []
+    for tab in tabs:
+        raw_label = tab.get("label") or tab.get("id")
+        label = str(raw_label or "Untitled section").strip()
+        position = tab.get("position")
+        if not isinstance(position, int):
+            position = None
+        sections.append(
+            {
+                "id": tab.get("id"),
+                "label": label,
+                "url": _canvas_link_url(tab.get("html_url")),
+                "type": tab.get("type"),
+                "position": position,
+                "hidden": bool(tab.get("hidden", False)),
+                "visibility": tab.get("visibility"),
+            }
+        )
+    sections.sort(
+        key=lambda section: (
+            section["position"] is None,
+            section["position"] if section["position"] is not None else 0,
+            section["label"].casefold(),
+        )
+    )
+    course_display = course_label(course) if course else f"Course {course_id}"
+    return {
+        "course_id": course_id,
+        "course": course_display,
+        "course_name": course.get("name") or course_display,
+        "url": f"{BASE_URL}/courses/{course_id}",
+        "sections": sections,
+    }
+
+
+def print_course_navigation(navigation: dict) -> None:
+    print(f"Course: {navigation['course']}")
+    print(f"URL: {navigation['url']}")
+    sections = navigation.get("sections") or []
+    if not sections:
+        print("No course sections found.")
+        return
+    print("Sections:")
+    for index, section in enumerate(sections, 1):
+        hidden = " [hidden]" if section.get("hidden") else ""
+        print(f"{index}. {section['label']}{hidden}")
+        if section.get("url"):
+            print(f"   URL: {section['url']}")
+    print()
+
+
 def _read_terminal_key(stream) -> str:
     descriptor = stream.fileno()
     first = os.read(descriptor, 1)
@@ -1358,6 +1863,685 @@ def batch_fetch_course_assignments(page, course_ids: list[int | str]) -> list[di
     )
 
 
+def _course_for_id(courses: list[dict], course_id: int) -> dict:
+    for course in courses:
+        if str(course.get("id")) == str(course_id):
+            return course
+    return {}
+
+
+def _resource_row(
+    resource: dict,
+    *,
+    resource_type: str,
+    course_id: int,
+    courses: list[dict],
+    tz: ZoneInfo,
+    url_fallback: str = "",
+) -> dict:
+    course = _course_for_id(courses, course_id)
+    course_name = (
+        course.get("course_code")
+        or course.get("name")
+        or f"Course {course_id}"
+    )
+    is_page = resource_type == "pages"
+    due = parse_canvas_datetime(resource.get("due_at")) if not is_page else None
+    description = resource.get("body") if is_page else resource.get("description")
+    if resource_type == "assignments":
+        title = resource.get("name")
+        untitled = "(Untitled assignment)"
+    elif resource_type == "quizzes":
+        title = resource.get("title")
+        untitled = "(Untitled quiz)"
+    else:
+        title = resource.get("title") or resource.get("name")
+        untitled = "(Untitled page)"
+    return {
+        "course": course_name,
+        "course_name": course.get("name") or course_name,
+        "title": title or untitled,
+        "due_at": due.isoformat() if due else None,
+        "due_display": (
+            due.astimezone(tz).strftime("%a, %b %d, %Y at %I:%M %p %Z")
+            if due
+            else "No due date"
+        ),
+        "instructions": html_to_text(description) or (
+            "(No page content provided)"
+            if is_page
+            else "(No instructions provided)"
+        ),
+        "attachments": extract_attachments(description),
+        "url": resource.get("html_url") or url_fallback,
+        "submission_status": (
+            submission_status(resource)
+            if resource_type == "assignments"
+            else None
+        ),
+    }
+
+
+def _page_target_url(course_id: int, page_url: str | None = None) -> str:
+    base = f"{BASE_URL}/courses/{course_id}/pages"
+    return f"{base}/{quote(page_url, safe='')}" if page_url else base
+
+
+def _page_row(
+    resource: dict,
+    *,
+    course_id: int,
+    courses: list[dict],
+    tz: ZoneInfo,
+    page_url: str | None = None,
+    url_fallback: str = "",
+) -> dict:
+    resource_page_url = resource.get("url")
+    if not isinstance(resource_page_url, str) or not resource_page_url:
+        resource_page_url = page_url
+    page_fallback = (
+        _page_target_url(course_id, resource_page_url)
+        if resource_page_url
+        else url_fallback
+    )
+    row = _resource_row(
+        resource,
+        resource_type="pages",
+        course_id=course_id,
+        courses=courses,
+        tz=tz,
+        url_fallback=page_fallback,
+    )
+    row["resource_type"] = "page"
+    row["page_id"] = resource.get("page_id", resource.get("id"))
+    row["page_url"] = resource_page_url
+    row["published"] = resource.get("published")
+    row["front_page"] = resource.get("front_page")
+    row["updated_at"] = resource.get("updated_at")
+    row["url"] = urljoin(BASE_URL + "/", row["url"])
+    return row
+
+
+def _file_row(
+    resource: dict,
+    *,
+    course_id: int,
+    courses: list[dict],
+) -> dict:
+    try:
+        file_id = int(resource.get("id"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Canvas returned a file without a valid ID") from exc
+
+    raw_name = resource.get("display_name") or resource.get("filename")
+    if not isinstance(raw_name, str):
+        raw_name = str(raw_name or "")
+    name = _normalize_attachment_label(raw_name) or f"file-{file_id}"
+    resolved = _canvas_file_download_url(resource.get("url"))
+    download_url = (
+        resolved[1]
+        if resolved is not None and resolved[0] == file_id
+        else f"{BASE_URL}/courses/{course_id}/files/{file_id}/download"
+    )
+    course = _course_for_id(courses, course_id)
+    course_name = (
+        course.get("course_code")
+        or course.get("name")
+        or f"Course {course_id}"
+    )
+    return {
+        "resource_type": "file",
+        "course": course_name,
+        "course_name": course.get("name") or course_name,
+        "course_id": course_id,
+        "id": file_id,
+        "title": name,
+        "name": name,
+        "filename": resource.get("filename") or name,
+        "content_type": (
+            resource.get("content-type")
+            or resource.get("content_type")
+        ),
+        "size": resource.get("size"),
+        "updated_at": (
+            resource.get("updated_at")
+            or resource.get("modified_at")
+        ),
+        "locked": (
+            resource.get("locked_for_user")
+            if "locked_for_user" in resource
+            else resource.get("locked")
+        ),
+        "hidden": resource.get("hidden"),
+        "folder_id": resource.get("folder_id"),
+        "url": download_url,
+        "preview_url": resource.get("preview_url"),
+    }
+
+
+def _fetch_page_target(
+    page,
+    course_id: int,
+    page_url: str | None,
+    target_url: str,
+    tz: ZoneInfo,
+    courses: list[dict] | None,
+) -> list[dict]:
+    if page_url is None:
+        resources = paginated_get(
+            page,
+            f"/api/v1/courses/{course_id}/pages",
+            [
+                ("sort", "title"),
+                ("order", "asc"),
+                ("include[]", "body"),
+            ],
+        )
+    else:
+        encoded_page_url = quote(page_url, safe="")
+        resource = api_get(
+            page,
+            f"/api/v1/courses/{course_id}/pages/{encoded_page_url}",
+            None,
+        )
+        resources = [resource]
+
+    if not isinstance(resources, list):
+        raise RuntimeError("Canvas returned an invalid page response")
+    if any(not isinstance(resource, dict) for resource in resources):
+        raise RuntimeError("Canvas returned an invalid page resource")
+
+    courses = fetch_courses(page) if courses is None else courses
+    return [
+        _page_row(
+            resource,
+            course_id=course_id,
+            courses=courses,
+            tz=tz,
+            page_url=page_url,
+            url_fallback=target_url,
+        )
+        for resource in resources
+    ]
+
+
+def _fetch_file_target(
+    page,
+    course_id: int,
+    file_id: int | None,
+    courses: list[dict] | None,
+) -> list[dict]:
+    if file_id is None:
+        resources = paginated_get(
+            page,
+            f"/api/v1/courses/{course_id}/files",
+            [("sort", "name"), ("order", "asc")],
+        )
+    else:
+        resource = api_get(
+            page,
+            f"/api/v1/courses/{course_id}/files/{file_id}",
+            None,
+        )
+        resources = [resource]
+
+    if not isinstance(resources, list):
+        raise RuntimeError("Canvas returned an invalid file response")
+    if any(not isinstance(resource, dict) for resource in resources):
+        raise RuntimeError("Canvas returned an invalid file resource")
+
+    courses = fetch_courses(page) if courses is None else courses
+    return [
+        _file_row(resource, course_id=course_id, courses=courses)
+        for resource in resources
+    ]
+def _canvas_navigation_guard(route, request) -> None:
+    try:
+        is_navigation = request.is_navigation_request()
+    except Exception:
+        is_navigation = getattr(request, "resource_type", "") == "document"
+    if not is_navigation:
+        route.continue_()
+        return
+
+    try:
+        parsed = urlsplit(str(request.url))
+    except Exception:
+        route.abort()
+        return
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != CANVAS_HOST.casefold()
+    ):
+        route.abort()
+        return
+    route.continue_()
+
+
+def _validate_final_course_url(
+    course_id: int,
+    final_url: str,
+) -> str:
+    try:
+        validated_url = validate_canvas_course_url(final_url)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Canvas course section navigation left ufl.instructure.com."
+        ) from exc
+    match = _COURSE_PATH_RE.match(urlsplit(validated_url).path)
+    if match is None or int(match.group("course_id")) != course_id:
+        raise RuntimeError(
+            "Canvas course section navigation left the requested course."
+        )
+    return validated_url
+
+
+def _web_target_content(page) -> tuple[str, str]:
+    for selector in ("main", "body"):
+        try:
+            locator = page.locator(selector)
+            if locator.count() == 0:
+                continue
+            text = str(locator.inner_text(timeout=60_000) or "").strip()
+            markup = str(locator.inner_html(timeout=60_000) or "")
+            return text, markup
+        except Exception:
+            continue
+    try:
+        return "", str(page.content() or "")
+    except Exception:
+        return "", ""
+
+
+def fetch_canvas_web_target(
+    page,
+    target_url: str,
+    courses: list[dict] | None = None,
+) -> list[dict]:
+    validated_url = validate_canvas_course_url(target_url)
+    parsed = urlsplit(validated_url)
+    match = _COURSE_PATH_RE.match(parsed.path)
+    if match is None:
+        raise RuntimeError("Canvas URL does not identify a course")
+    course_id = int(match.group("course_id"))
+
+    page.route("**/*", _canvas_navigation_guard)
+    try:
+        response = page.goto(
+            validated_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        if response is None:
+            raise RuntimeError(
+                f"Canvas course section returned no response: {validated_url}"
+            )
+        if not getattr(response, "ok", False):
+            raise RuntimeError(
+                "Canvas course section request failed "
+                f"({getattr(response, 'status', 0)}): {validated_url}"
+            )
+        effective_url = _validate_final_course_url(
+            course_id,
+            str(getattr(page, "url", "") or ""),
+        )
+        text, markup = _web_target_content(page)
+        try:
+            title = str(page.title() or "").strip()
+        except Exception:
+            title = ""
+        if not title:
+            title = next(
+                (line.strip() for line in text.splitlines() if line.strip()),
+                "Canvas course section",
+            )
+    finally:
+        page.unroute("**/*", _canvas_navigation_guard)
+    courses = fetch_courses(page) if courses is None else courses
+    course = _course_for_id(courses, course_id)
+    course_display = course_label(course) if course else f"Course {course_id}"
+    return [
+        {
+            "resource_type": "course_section",
+            "course": course_display,
+            "course_name": course.get("name") or course_display,
+            "course_id": course_id,
+            "title": title,
+            "due_at": None,
+            "due_display": "No due date",
+            "instructions": text or "(No page content provided)",
+            "attachments": extract_attachments(markup),
+            "url": effective_url,
+            "submission_status": None,
+        }
+    ]
+
+
+def fetch_canvas_target(
+    page,
+    target_url: str,
+    tz: ZoneInfo = ZoneInfo("America/New_York"),
+    courses: list[dict] | None = None,
+) -> list[dict]:
+    try:
+        resource_type, course_id, resource_id = parse_canvas_resource_url(target_url)
+    except ValueError:
+        validate_canvas_course_url(target_url)
+        return fetch_canvas_web_target(page, target_url, courses=courses)
+    if resource_type == "pages":
+        return _fetch_page_target(
+            page,
+            course_id,
+            resource_id if isinstance(resource_id, str) else None,
+            target_url,
+            tz,
+            courses,
+        )
+    if resource_type == "files":
+        return _fetch_file_target(
+            page,
+            course_id,
+            resource_id if isinstance(resource_id, int) else None,
+            courses,
+        )
+    if resource_type not in {"assignments", "quizzes"}:
+        raise RuntimeError(f"Unsupported Canvas resource type: {resource_type}")
+
+    params = (
+        [("include[]", "submission")]
+        if resource_type == "assignments"
+        else None
+    )
+    resource = api_get(
+        page,
+        f"/api/v1/courses/{course_id}/{resource_type}/{resource_id}",
+        params,
+    )
+    if not isinstance(resource, dict):
+        raise RuntimeError(
+            f"Unexpected Canvas response for {resource_type} {resource_id}"
+        )
+    courses = fetch_courses(page) if courses is None else courses
+    return [
+        _resource_row(
+            resource,
+            resource_type=resource_type,
+            course_id=course_id,
+            courses=courses,
+            tz=tz,
+            url_fallback=target_url,
+        )
+    ]
+
+
+class SubmissionCancelled(RuntimeError):
+    pass
+
+
+def _validated_submission_files(
+    file_paths: list[str],
+    allowed_extensions,
+) -> list[Path]:
+    if not file_paths:
+        raise ValueError("at least one --file is required")
+
+    allowed = {
+        str(extension).casefold().lstrip(".")
+        for extension in (allowed_extensions or [])
+    }
+    validated = []
+    for value in file_paths:
+        path = Path(value).expanduser()
+        if not path.is_file():
+            raise ValueError(f"submission file is not a readable file: {path}")
+        if allowed:
+            extension = path.suffix.lstrip(".").casefold()
+            if extension not in allowed:
+                values = ", ".join(sorted(allowed))
+                raise ValueError(
+                    f"{path.name} is not an allowed file type; "
+                    f"Canvas allows: {values}"
+                )
+        validated.append(path)
+    return validated
+
+
+def prepare_file_submission(
+    page,
+    target_url: str,
+    file_paths: list[str],
+    *,
+    courses: list[dict] | None = None,
+    tz: ZoneInfo = ZoneInfo("America/New_York"),
+) -> dict:
+    resource_type, course_id, assignment_id = parse_canvas_target_url(target_url)
+    if resource_type != "assignments":
+        raise ValueError(
+            "file submissions require an assignment URL; "
+            "quiz URLs must be opened in Canvas"
+        )
+
+    assignment = api_get(
+        page,
+        f"/api/v1/courses/{course_id}/assignments/{assignment_id}",
+        [("include[]", "submission")],
+    )
+    if not isinstance(assignment, dict):
+        raise RuntimeError("Canvas returned an invalid assignment response")
+    if assignment.get("published") is False:
+        raise RuntimeError("Canvas assignment is unpublished")
+    if assignment.get("locked_for_user"):
+        raise RuntimeError("Canvas assignment is locked for this user")
+
+    submission_types = {
+        str(value).casefold()
+        for value in (assignment.get("submission_types") or [])
+    }
+    if "online_upload" not in submission_types:
+        raise RuntimeError(
+            "Canvas assignment does not accept file uploads "
+            f"(submission types: {', '.join(sorted(submission_types)) or 'none'})"
+        )
+
+    files = _validated_submission_files(
+        file_paths,
+        assignment.get("allowed_extensions"),
+    )
+    courses = fetch_courses(page) if courses is None else courses
+    return {
+        "course_id": course_id,
+        "assignment_id": assignment_id,
+        "files": files,
+        "assignment": _resource_row(
+            assignment,
+            resource_type="assignments",
+            course_id=course_id,
+            courses=courses,
+            tz=tz,
+            url_fallback=target_url,
+        ),
+    }
+
+
+def _canvas_upload_completion_url(upload_url: str, location: str | None) -> str:
+    if not location:
+        raise RuntimeError("Canvas upload did not provide a completion URL")
+    completion_url = urljoin(upload_url, location)
+    parsed = urlsplit(completion_url)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != CANVAS_HOST.casefold()
+        or not parsed.path.startswith("/api/")
+    ):
+        raise RuntimeError("Canvas upload returned an unsafe completion URL")
+    return completion_url
+
+
+def _upload_submission_file(
+    page,
+    course_id: int,
+    assignment_id: int,
+    path: Path,
+) -> dict:
+    content_type = (
+        mimetypes.guess_type(path.name)[0]
+        or "application/octet-stream"
+    )
+    initial_form = FormData()
+    initial_form.append("name", path.name)
+    initial_form.append("size", str(path.stat().st_size))
+    initial_form.append("content_type", content_type)
+    initial = api_post(
+        page,
+        f"/api/v1/courses/{course_id}/assignments/"
+        f"{assignment_id}/submissions/self/files",
+        multipart=initial_form,
+    )
+    if not isinstance(initial, dict):
+        raise RuntimeError("Canvas returned an invalid upload token response")
+
+    upload_url = initial.get("upload_url")
+    upload_params = initial.get("upload_params")
+    if not isinstance(upload_url, str) or not upload_url:
+        raise RuntimeError("Canvas did not return an upload URL")
+    if urlsplit(upload_url).scheme != "https":
+        raise RuntimeError("Canvas returned an unsafe upload URL")
+    if not isinstance(upload_params, dict):
+        raise RuntimeError("Canvas did not return upload parameters")
+
+    upload_form = FormData()
+    for key, value in upload_params.items():
+        if value is None:
+            value = ""
+        if not isinstance(value, (str, int, float, bool)):
+            raise RuntimeError("Canvas returned unsupported upload parameters")
+        upload_form.append(str(key), value)
+    upload_form.append(
+        "file",
+        {
+            "name": path.name,
+            "mimeType": content_type,
+            "buffer": path.read_bytes(),
+        },
+    )
+
+    request = _request_client(page)
+    response = request.post(
+        upload_url,
+        headers={"Accept": "application/json"},
+        multipart=upload_form,
+        timeout=60_000,
+        max_redirects=0,
+    )
+    location = (getattr(response, "headers", {}) or {}).get("location")
+    if response.status == 201 or 300 <= response.status < 400:
+        response = request.get(
+            _canvas_upload_completion_url(upload_url, location),
+            headers={"Accept": "application/json"},
+            timeout=60_000,
+        )
+    result = _response_json(response, upload_url)
+    if not isinstance(result, dict):
+        raise RuntimeError("Canvas returned an invalid uploaded-file response")
+    return result
+
+
+def confirm_file_submission(plan: dict) -> None:
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        raise RuntimeError(
+            "refusing to submit without an interactive terminal; "
+            "use --dry-run to preview the submission"
+        )
+
+    assignment = plan["assignment"]
+    print(
+        f"About to submit {len(plan['files'])} file(s) to "
+        f"{assignment['title']!r} in {assignment['course']!r}.",
+        file=sys.stderr,
+    )
+    for path in plan["files"]:
+        print(f"  File: {path}", file=sys.stderr)
+    print(
+        "This will create or replace your Canvas submission. "
+        "Type SUBMIT to continue:",
+        file=sys.stderr,
+        flush=True,
+    )
+    answer = sys.stdin.readline().strip()
+    if answer != "SUBMIT":
+        raise SubmissionCancelled("Submission cancelled; Canvas was not changed.")
+
+
+def dry_run_file_submission(plan: dict) -> dict:
+    return {
+        "submitted": False,
+        "dry_run": True,
+        "assignment": plan["assignment"],
+        "files": [
+            {"name": path.name, "path": str(path)}
+            for path in plan["files"]
+        ],
+    }
+
+
+def submit_file_assignment(page, plan: dict, progress=None) -> dict:
+    uploaded = []
+    for path in plan["files"]:
+        if progress is not None:
+            progress.message(f"Uploading {path.name}...")
+        uploaded_file = _upload_submission_file(
+            page,
+            plan["course_id"],
+            plan["assignment_id"],
+            path,
+        )
+        file_id = uploaded_file.get("id")
+        if file_id is None:
+            raise RuntimeError(
+                f"Canvas did not return a file ID for {path.name}"
+            )
+        uploaded.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "file_id": file_id,
+            }
+        )
+
+    submission_form = FormData()
+    submission_form.append("submission[submission_type]", "online_upload")
+    for uploaded_file in uploaded:
+        submission_form.append(
+            "submission[file_ids][]",
+            str(uploaded_file["file_id"]),
+        )
+    submission = api_post(
+        page,
+        f"/api/v1/courses/{plan['course_id']}/assignments/"
+        f"{plan['assignment_id']}/submissions",
+        multipart=submission_form,
+    )
+    return {
+        "submitted": True,
+        "dry_run": False,
+        "assignment": plan["assignment"],
+        "files": uploaded,
+        "submission": submission,
+    }
+
+
+def print_submission_human(result: dict) -> None:
+    assignment = result["assignment"]
+    print(f"Assignment: {assignment['title']}")
+    print(f"Course: {assignment['course']}")
+    for file_info in result["files"]:
+        print(f"File: {file_info['path']}")
+    if result.get("dry_run"):
+        print("Dry run only; Canvas was not changed.")
+    else:
+        print("Canvas submission completed.")
+
+
 def fetch_assignments(
     page,
     days: int | str = 14,
@@ -1411,23 +2595,14 @@ def fetch_assignments(
             status = submission_status(assignment)
             if not status_matches(status, status_filter):
                 continue
-            instructions = html_to_text(assignment.get("description"))
-
             rows.append(
-                {
-                    "course": course_name,
-                    "course_name": course.get("name") or course_name,
-                    "title": assignment.get("name") or "(Untitled assignment)",
-                    "due_at": due.isoformat() if due else None,
-                    "due_display": (
-                        due.astimezone(tz).strftime("%a, %b %d, %Y at %I:%M %p %Z")
-                        if due
-                        else "No due date"
-                    ),
-                    "instructions": instructions or "(No instructions provided)",
-                    "url": assignment.get("html_url") or "",
-                    "submission_status": status,
-                }
+                _resource_row(
+                    assignment,
+                    resource_type="assignments",
+                    course_id=course_id,
+                    courses=courses,
+                    tz=tz,
+                )
             )
 
     # Due-dated assignments first, then assignments without due dates.
@@ -1459,10 +2634,25 @@ def print_human(rows, *, shorten: bool = False):
         return
 
     for index, item in enumerate(rows, 1):
+        if item.get("resource_type") == "file":
+            print(f"{index}. {item['name']}")
+            print(f"   Course: {item['course']}")
+            if item.get("content_type"):
+                print(f"   Type: {item['content_type']}")
+            if item.get("size") is not None:
+                print(f"   Size: {item['size']} bytes")
+            if item.get("updated_at"):
+                print(f"   Updated: {item['updated_at']}")
+            if item.get("url"):
+                print(f"   URL: {item['url']}")
+            if item.get("local_path"):
+                print(f"   Downloaded to: {item['local_path']}")
+            print()
+            continue
         print(f"{index}. {item['title']}")
         print(f"   Course: {item['course']}")
         print(f"   Due: {item['due_display']}")
-        if not shorten:
+        if not shorten and item.get("submission_status") is not None:
             print(f"   Status: {item['submission_status']}")
         if item["url"]:
             print(f"   URL: {item['url']}")
@@ -1470,12 +2660,35 @@ def print_human(rows, *, shorten: bool = False):
             print("   Instructions:")
             for line in item["instructions"].splitlines() or [""]:
                 print(f"     {line}")
+        attachments = item.get("attachments") or []
+        if attachments:
+            print("   Attachments:")
+            for attachment in attachments:
+                detail = f"{attachment['name']}: {attachment['url']}"
+                if attachment.get("local_path"):
+                    detail += f" (downloaded to {attachment['local_path']})"
+                print(f"     {detail}")
         print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch upcoming UF Canvas assignments, deadlines, and instructions."
+        usage="%(prog)s [COMMAND] [ARGUMENT] [OPTIONS]",
+        description=(
+            "Read UF Canvas assignments, quizzes, pages, files, and "
+            "course navigation."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Commands:\n"
+            "  (no command)                       Fetch upcoming assignments.\n"
+            "  auth setup                         Configure Canvas credentials.\n"
+            "  student on|off|status              Manage student-only course mode.\n"
+            "  course COURSE_ID                   List clickable course sections.\n"
+            "  fetch CANVAS_URL [--download-dir DIRECTORY]\n"
+            "                                     Fetch an assignment, quiz, page, or files.\n"
+            "  submit ASSIGNMENT_URL --file PATH  Submit one or more assignment files.\n"
+        ),
     )
     parser.add_argument(
         "command",
@@ -1496,6 +2709,23 @@ def main():
         "--shorten",
         action="store_true",
         help="Omit instructions and submission status from assignment output.",
+    )
+    parser.add_argument(
+        "--download-dir",
+        metavar="DIRECTORY",
+        help="Download Canvas files linked in instructions to DIRECTORY.",
+    )
+    parser.add_argument(
+        "--file",
+        dest="submission_files",
+        action="append",
+        metavar="PATH",
+        help="File to submit; repeat for multiple files with canvas submit.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show a file submission plan without uploading or submitting it.",
     )
     parser.add_argument(
         "--days",
@@ -1528,12 +2758,18 @@ def main():
         help="Assignment status to include: unsubmitted (default), submitted, graded, or all.",
     )
     args = parser.parse_args()
+    course_navigation_mode = False
+    course_id = None
+    target_resource_type = None
 
     if args.command == "auth":
         if args.action != "setup":
             parser.error(
                 "supported commands: canvas auth setup; "
-                "canvas student on|off|status"
+                "canvas student on|off|status; "
+                "canvas course COURSE_ID; "
+                "canvas fetch CANVAS_URL; "
+                "canvas submit ASSIGNMENT_URL --file PATH"
             )
         try:
             return configure_auth()
@@ -1548,7 +2784,10 @@ def main():
         if args.action not in STUDENT_MODE_COMMANDS:
             parser.error(
                 "supported commands: canvas auth setup; "
-                "canvas student on|off|status"
+                "canvas student on|off|status; "
+                "canvas course COURSE_ID; "
+                "canvas fetch CANVAS_URL; "
+                "canvas submit ASSIGNMENT_URL --file PATH"
             )
         try:
             return student_mode_command(args.action)
@@ -1558,11 +2797,97 @@ def main():
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-    if args.command is not None or args.action is not None:
+
+    if args.command == "course":
+        if not args.action:
+            parser.error("usage: canvas course COURSE_ID")
+        if args.download_dir:
+            parser.error("--download-dir cannot be combined with canvas course")
+        if args.submission_files or args.dry_run:
+            parser.error("--file and --dry-run require canvas submit")
+        if args.courses:
+            parser.error("--course cannot be combined with canvas course")
+        if args.list_courses:
+            parser.error("--list-courses cannot be combined with canvas course")
+        if args.days != "14":
+            parser.error("--days cannot be combined with canvas course")
+        if args.status != "unsubmitted":
+            parser.error("--status cannot be combined with canvas course")
+        try:
+            course_id = parse_course_id(args.action)
+        except ValueError as exc:
+            parser.error(str(exc))
+        target_url = None
+        target_fetch = False
+        submission_mode = False
+        course_navigation_mode = True
+    elif args.command == "submit":
+        if not args.action:
+            parser.error("usage: canvas submit ASSIGNMENT_URL --file PATH")
+        if not args.submission_files:
+            parser.error("canvas submit requires at least one --file PATH")
+        if args.download_dir:
+            parser.error("--download-dir cannot be combined with canvas submit")
+        if args.courses:
+            parser.error("--course cannot be combined with canvas submit")
+        if args.list_courses:
+            parser.error("--list-courses cannot be combined with canvas submit")
+        if args.days != "14":
+            parser.error("--days cannot be combined with canvas submit")
+        if args.status != "unsubmitted":
+            parser.error("--status cannot be combined with canvas submit")
+        try:
+            resource_type, _, _ = parse_canvas_target_url(args.action)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if resource_type != "assignments":
+            parser.error(
+                "file submissions require an assignment URL; "
+                "quiz URLs must be opened in Canvas"
+            )
+        target_url = args.action
+        target_fetch = False
+        submission_mode = True
+    elif args.command == "fetch":
+        if not args.action:
+            parser.error("usage: canvas fetch CANVAS_URL")
+        if args.submission_files or args.dry_run:
+            parser.error("--file and --dry-run require canvas submit")
+        if args.courses:
+            parser.error("--course cannot be combined with canvas fetch")
+        if args.list_courses:
+            parser.error("--list-courses cannot be combined with canvas fetch")
+        if args.days != "14":
+            parser.error("--days cannot be combined with canvas fetch")
+        if args.status != "unsubmitted":
+            parser.error("--status cannot be combined with canvas fetch")
+        try:
+            validate_canvas_course_url(args.action)
+            try:
+                target_resource_type, _, _ = parse_canvas_resource_url(
+                    args.action
+                )
+            except ValueError:
+                target_resource_type = None
+        except ValueError as exc:
+            parser.error(str(exc))
+        target_url = args.action
+        target_fetch = True
+        submission_mode = False
+    elif args.command is not None or args.action is not None:
         parser.error(
             "supported commands: canvas auth setup; "
-            "canvas student on|off|status"
+            "canvas student on|off|status; "
+            "canvas course COURSE_ID; "
+            "canvas fetch CANVAS_URL; "
+            "canvas submit ASSIGNMENT_URL --file PATH"
         )
+    else:
+        if args.submission_files or args.dry_run:
+            parser.error("--file and --dry-run require canvas submit")
+        target_url = None
+        target_fetch = False
+        submission_mode = False
     try:
         student_only = load_student_mode() == STUDENT_MODE_ON
     except Exception as exc:
@@ -1614,15 +2939,17 @@ def main():
                     else contextlib.nullcontext()
                 )
                 with terminal_session:
-                    courses = (
-                        _select_ordered_courses(
+                    if submission_mode or target_fetch or course_navigation_mode:
+                        courses = available_courses
+                    elif interactive_course:
+                        courses = _select_ordered_courses(
                             _ordered_courses(available_courses),
                             sys.stdin,
                             sys.stderr,
                         )
-                        if interactive_course
-                        else filter_courses(available_courses, course_filters)
-                    )
+                    else:
+                        courses = filter_courses(available_courses, course_filters)
+
                     if args.list_courses:
                         course_rows = [
                             course_summary(course)
@@ -1631,6 +2958,56 @@ def main():
                                 key=lambda item: course_label(item).casefold(),
                             )
                         ]
+                    elif course_navigation_mode:
+                        with _loading_bar(
+                            sys.stderr,
+                            "Loading course sections",
+                            "Course sections loaded.",
+                        ):
+                            navigation = fetch_course_navigation(
+                                page,
+                                course_id,
+                                courses=available_courses,
+                            )
+                    elif submission_mode:
+                        with _loading_bar(
+                            sys.stderr,
+                            "Preparing Canvas submission",
+                            "Canvas submission ready.",
+                        ):
+                            plan = prepare_file_submission(
+                                page,
+                                target_url,
+                                args.submission_files,
+                                courses=available_courses,
+                                tz=tz,
+                            )
+                        if args.dry_run:
+                            submission_result = dry_run_file_submission(plan)
+                        else:
+                            confirm_file_submission(plan)
+                            with _loading_bar(
+                                sys.stderr,
+                                "Submitting Canvas files",
+                                "Canvas files submitted.",
+                            ) as submission_progress:
+                                submission_result = submit_file_assignment(
+                                    page,
+                                    plan,
+                                    progress=submission_progress,
+                                )
+                    elif target_fetch:
+                        with _loading_bar(
+                            sys.stderr,
+                            "Loading Canvas resource",
+                            "Canvas resource loaded.",
+                        ):
+                            rows = fetch_canvas_target(
+                                page,
+                                target_url,
+                                tz,
+                                courses=available_courses,
+                            )
                     else:
                         with _loading_bar(
                             sys.stderr,
@@ -1643,12 +3020,37 @@ def main():
                                 tz,
                                 courses=courses,
                                 status_filter=args.status,
+                                progress=assignments_progress,
                             )
+
+                    if args.download_dir and not args.list_courses:
+                        with _loading_bar(
+                            sys.stderr,
+                            "Downloading Canvas attachments",
+                            "Canvas attachments downloaded.",
+                        ) as download_progress:
+                            if target_fetch and target_resource_type == "files":
+                                download_files(
+                                    page,
+                                    rows,
+                                    args.download_dir,
+                                    progress=download_progress,
+                                )
+                            else:
+                                download_attachments(
+                                    page,
+                                    rows,
+                                    args.download_dir,
+                                    progress=download_progress,
+                                )
                     if interactive_course:
                         _flush_terminal_input(sys.stdin)
             finally:
                 context.close()
 
+    except SubmissionCancelled as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         return 130
@@ -1662,6 +3064,24 @@ def main():
             print(json.dumps(course_rows, indent=2, ensure_ascii=False))
         else:
             print_courses(courses)
+    elif course_navigation_mode:
+        if args.json:
+            print(json.dumps(navigation, indent=2, ensure_ascii=False))
+        else:
+            print_course_navigation(navigation)
+    elif submission_mode:
+        output_result = submission_result
+        if args.shorten:
+            output_result = {
+                **submission_result,
+                "assignment": shorten_rows(
+                    [submission_result["assignment"]]
+                )[0],
+            }
+        if args.json:
+            print(json.dumps(output_result, indent=2, ensure_ascii=False))
+        else:
+            print_submission_human(output_result)
     elif args.json:
         output_rows = shorten_rows(rows) if args.shorten else rows
         print(json.dumps(output_rows, indent=2, ensure_ascii=False))

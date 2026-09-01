@@ -341,6 +341,123 @@ class CourseAndStatusTests(unittest.TestCase):
             "2. NUR3145 — Pharmacology",
         ])
 
+    @mock.patch.object(canvas, "paginated_get")
+    def test_fetch_course_navigation_returns_clickable_sections(self, paginated_get):
+        paginated_get.return_value = [
+            {
+                "id": "announcements",
+                "label": "Announcements",
+                "html_url": "/courses/574892/announcements",
+                "position": 2,
+                "type": "internal",
+            },
+            {
+                "id": "home",
+                "label": "Home",
+                "html_url": "/courses/574892",
+                "position": 1,
+                "type": "internal",
+            },
+            {
+                "id": "external_tool_1",
+                "label": "Course Tool",
+                "html_url": "https://tools.example.test/course/574892",
+                "position": 3,
+                "type": "external",
+            },
+        ]
+
+        navigation = canvas.fetch_course_navigation(
+            object(),
+            574892,
+            courses=[
+                {"id": 574892, "course_code": "COP3503", "name": "Programming"}
+            ],
+        )
+
+        paginated_get.assert_called_once_with(
+            mock.ANY,
+            "/api/v1/courses/574892/tabs",
+        )
+        self.assertEqual(navigation["course"], "COP3503 — Programming")
+        self.assertEqual(
+            [section["label"] for section in navigation["sections"]],
+            ["Home", "Announcements", "Course Tool"],
+        )
+        self.assertEqual(
+            navigation["sections"][1]["url"],
+            "https://ufl.instructure.com/courses/574892/announcements",
+        )
+        self.assertEqual(
+            navigation["sections"][2]["url"],
+            "https://tools.example.test/course/574892",
+        )
+
+    def test_course_navigation_human_output_includes_clickable_urls(self):
+        output = io.StringIO()
+        navigation = {
+            "course": "COP3503 — Programming",
+            "url": "https://ufl.instructure.com/courses/574892",
+            "sections": [
+                {
+                    "label": "Home",
+                    "url": "https://ufl.instructure.com/courses/574892",
+                    "hidden": False,
+                }
+            ],
+        }
+
+        with contextlib.redirect_stdout(output):
+            canvas.print_course_navigation(navigation)
+
+        self.assertIn("Sections:", output.getvalue())
+        self.assertIn("1. Home", output.getvalue())
+        self.assertIn(
+            "URL: https://ufl.instructure.com/courses/574892",
+            output.getvalue(),
+        )
+
+    def test_main_course_command_outputs_navigation(self):
+        context = mock.Mock()
+        page = object()
+        context.pages = [page]
+        sync = mock.Mock()
+        sync.__enter__ = mock.Mock(return_value=object())
+        sync.__exit__ = mock.Mock(return_value=None)
+        courses = [
+            {"id": 574892, "course_code": "COP3503", "name": "Programming"}
+        ]
+        navigation = {
+            "course_id": 574892,
+            "course": "COP3503 — Programming",
+            "course_name": "Programming",
+            "url": "https://ufl.instructure.com/courses/574892",
+            "sections": [],
+        }
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as profile, mock.patch(
+            "sys.argv",
+            ["canvas", "course", "574892", "--json"],
+        ), mock.patch.object(canvas, "PROFILE_DIR", Path(profile)), mock.patch.object(
+            canvas, "sync_playwright", return_value=sync
+        ), mock.patch.object(canvas, "launch_context", return_value=context), mock.patch.object(
+            canvas, "ensure_login"
+        ), mock.patch.object(canvas, "fetch_courses", return_value=courses), mock.patch.object(
+            canvas, "fetch_course_navigation", return_value=navigation
+        ) as fetch_navigation, contextlib.redirect_stdout(output), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(canvas.main(), 0)
+
+        self.assertEqual(json.loads(output.getvalue()), navigation)
+        fetch_navigation.assert_called_once_with(
+            page,
+            574892,
+            courses=courses,
+        )
+        context.close.assert_called_once()
+
     def test_interactive_course_picker_selects_multiple_courses(self):
         output = io.StringIO()
         keys = iter(["down", "toggle", "up", "toggle", "confirm"])
@@ -1028,6 +1145,708 @@ class CourseAndStatusTests(unittest.TestCase):
         ) as fetch, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(canvas.main(), 0)
             self.assertEqual(fetch.call_args.args[1], 0)
+
+
+class AttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.config_root = tempfile.TemporaryDirectory()
+        self.config_environment = mock.patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": self.config_root.name},
+            clear=False,
+        )
+        self.config_environment.start()
+
+    def tearDown(self):
+        self.config_environment.stop()
+        self.config_root.cleanup()
+
+    def test_extract_attachments_accepts_canvas_links_only_and_deduplicates(self):
+        description = """
+          <a href="/courses/570905/files/12/download?download_frd=1">
+            syllabus.pdf
+          </a>
+          <a href="https://ufl.instructure.com/files/13/preview">
+            <strong>study guide.docx</strong>
+          </a>
+          <a href="https://example.com/files/99/download">external.pdf</a>
+          <a href="/courses/570905/files/12/download?download_frd=1">
+            duplicate.pdf
+          </a>
+        """
+
+        self.assertEqual(
+            canvas.extract_attachments(description),
+            [
+                {
+                    "name": "syllabus.pdf",
+                    "file_id": 12,
+                    "url": (
+                        "https://ufl.instructure.com/courses/570905/files/"
+                        "12/download?download_frd=1"
+                    ),
+                },
+                {
+                    "name": "study guide.docx",
+                    "file_id": 13,
+                    "url": "https://ufl.instructure.com/files/13/download",
+                },
+            ],
+        )
+
+    def test_parse_canvas_target_url_supports_quizzes_and_rejects_other_hosts(self):
+        self.assertEqual(
+            canvas.parse_canvas_target_url(
+                "https://ufl.instructure.com/courses/570905/quizzes/1650213"
+                "?from=calendar#details"
+            ),
+            ("quizzes", 570905, 1650213),
+        )
+        with self.assertRaisesRegex(ValueError, "https://ufl.instructure.com"):
+            canvas.parse_canvas_target_url(
+                "https://evil.example/courses/570905/quizzes/1650213"
+            )
+
+    def test_parse_canvas_resource_url_supports_pages_and_files(self):
+        self.assertEqual(
+            canvas.parse_canvas_resource_url(
+                "https://ufl.instructure.com/courses/574892/pages/"
+                "project-setup-intellij-slash-gradle"
+            ),
+            ("pages", 574892, "project-setup-intellij-slash-gradle"),
+        )
+        self.assertEqual(
+            canvas.parse_canvas_resource_url(
+                "https://ufl.instructure.com/courses/575787/files"
+            ),
+            ("files", 575787, None),
+        )
+        self.assertEqual(
+            canvas.parse_canvas_resource_url(
+                "https://ufl.instructure.com/courses/575787/files/42"
+            ),
+            ("files", 575787, 42),
+        )
+
+    @mock.patch.object(canvas, "api_get")
+    def test_fetch_canvas_target_returns_quiz_instructions_and_attachments(
+        self,
+        api_get,
+    ):
+        page = object()
+        api_get.return_value = {
+            "id": 1650213,
+            "title": "Reading Quiz",
+            "description": (
+                '<p>Read the attached handout.</p>'
+                '<a href="/courses/570905/files/44/download">handout.pdf</a>'
+            ),
+            "due_at": "2026-09-01T23:59:00Z",
+            "html_url": (
+                "https://ufl.instructure.com/courses/570905/quizzes/1650213"
+            ),
+        }
+        courses = [
+            {"id": 570905, "course_code": "NUR3145", "name": "Pharmacology"}
+        ]
+
+        rows = canvas.fetch_canvas_target(
+            page,
+            "https://ufl.instructure.com/courses/570905/quizzes/1650213",
+            canvas.ZoneInfo("UTC"),
+            courses=courses,
+        )
+
+        api_get.assert_called_once_with(
+            page,
+            "/api/v1/courses/570905/quizzes/1650213",
+            None,
+        )
+        self.assertEqual(rows[0]["title"], "Reading Quiz")
+        self.assertEqual(rows[0]["course"], "NUR3145")
+        self.assertEqual(
+            rows[0]["instructions"],
+            "Read the attached handout.\nhandout.pdf",
+        )
+        self.assertEqual(rows[0]["attachments"][0]["file_id"], 44)
+        self.assertIsNone(rows[0]["submission_status"])
+
+    @mock.patch.object(canvas, "api_get")
+    def test_fetch_canvas_target_reads_page_content(self, api_get):
+        page = object()
+        api_get.return_value = {
+            "page_id": 8,
+            "url": "project-setup-intellij-slash-gradle",
+            "title": "Project Setup",
+            "body": (
+                "<h1>Project Setup</h1>"
+                "<p>Install IntelliJ and Gradle.</p>"
+                '<a href="/courses/574892/files/42/download">setup.zip</a>'
+            ),
+            "published": True,
+            "front_page": False,
+            "updated_at": "2026-03-20T12:00:00Z",
+        }
+        courses = [
+            {"id": 574892, "course_code": "COP3503", "name": "Programming"}
+        ]
+
+        rows = canvas.fetch_canvas_target(
+            page,
+            "https://ufl.instructure.com/courses/574892/pages/"
+            "project-setup-intellij-slash-gradle",
+            canvas.ZoneInfo("UTC"),
+            courses=courses,
+        )
+
+        api_get.assert_called_once_with(
+            page,
+            "/api/v1/courses/574892/pages/"
+            "project-setup-intellij-slash-gradle",
+            None,
+        )
+        self.assertEqual(rows[0]["resource_type"], "page")
+        self.assertEqual(rows[0]["page_id"], 8)
+        self.assertEqual(rows[0]["title"], "Project Setup")
+        self.assertEqual(
+            rows[0]["instructions"],
+            "Project Setup\n\nInstall IntelliJ and Gradle.\nsetup.zip",
+        )
+        self.assertEqual(
+            rows[0]["url"],
+            "https://ufl.instructure.com/courses/574892/pages/"
+            "project-setup-intellij-slash-gradle",
+        )
+        self.assertEqual(rows[0]["attachments"][0]["file_id"], 42)
+
+    @mock.patch.object(canvas, "paginated_get")
+    def test_fetch_canvas_target_lists_course_files(self, paginated_get):
+        page = object()
+        paginated_get.return_value = [{
+            "id": 42,
+            "display_name": "setup.zip",
+            "filename": "setup.zip",
+            "content-type": "application/zip",
+            "size": 2048,
+            "updated_at": "2026-03-20T12:00:00Z",
+            "url": (
+                "https://ufl.instructure.com/courses/575787/files/"
+                "42/download?download_frd=1"
+            ),
+        }]
+        courses = [
+            {"id": 575787, "course_code": "COP4600", "name": "Operating Systems"}
+        ]
+
+        rows = canvas.fetch_canvas_target(
+            page,
+            "https://ufl.instructure.com/courses/575787/files",
+            courses=courses,
+        )
+
+        paginated_get.assert_called_once_with(
+            page,
+            "/api/v1/courses/575787/files",
+            [("sort", "name"), ("order", "asc")],
+        )
+        self.assertEqual(rows[0]["resource_type"], "file")
+        self.assertEqual(rows[0]["name"], "setup.zip")
+        self.assertEqual(rows[0]["size"], 2048)
+        self.assertEqual(rows[0]["content_type"], "application/zip")
+        self.assertEqual(
+            rows[0]["url"],
+            "https://ufl.instructure.com/courses/575787/files/"
+            "42/download?download_frd=1",
+        )
+
+    def test_canvas_navigation_guard_blocks_external_document_requests(self):
+        route = mock.Mock()
+        request = mock.Mock()
+        request.is_navigation_request.return_value = True
+        request.url = "https://evil.example/course"
+
+        canvas._canvas_navigation_guard(route, request)
+
+        route.abort.assert_called_once_with()
+        route.continue_.assert_not_called()
+
+        route.reset_mock()
+        request.url = "https://ufl.instructure.com/courses/574892"
+        canvas._canvas_navigation_guard(route, request)
+
+        route.continue_.assert_called_once_with()
+        route.abort.assert_not_called()
+
+    def test_fetch_canvas_target_reads_unmodeled_course_section(self):
+        page = mock.Mock()
+        main = mock.Mock()
+        main.count.return_value = 1
+        main.inner_text.return_value = "Announcements\nA notice"
+        main.inner_html.return_value = (
+            '<p>A notice</p>'
+            '<a href="/courses/574892/files/42/download">details.pdf</a>'
+        )
+        page.locator.return_value = main
+        page.title.return_value = "Announcements | Programming"
+        page.url = "https://ufl.instructure.com/courses/574892/announcements"
+        page.goto.return_value = mock.Mock(ok=True, status=200)
+        target_url = "https://ufl.instructure.com/courses/574892/announcements"
+
+        rows = canvas.fetch_canvas_target(
+            page,
+            target_url,
+            courses=[
+                {"id": 574892, "course_code": "COP3503", "name": "Programming"}
+            ],
+        )
+
+        page.goto.assert_called_once_with(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        page.route.assert_called_once_with(
+            "**/*",
+            canvas._canvas_navigation_guard,
+        )
+        page.unroute.assert_called_once_with(
+            "**/*",
+            canvas._canvas_navigation_guard,
+        )
+        self.assertEqual(rows[0]["resource_type"], "course_section")
+        self.assertEqual(rows[0]["title"], "Announcements | Programming")
+        self.assertEqual(rows[0]["instructions"], "Announcements\nA notice")
+        self.assertEqual(rows[0]["attachments"][0]["file_id"], 42)
+
+    def test_fetch_canvas_web_target_rejects_missing_or_http_error_response(self):
+        target_url = "https://ufl.instructure.com/courses/574892/announcements"
+        for response in (None, mock.Mock(ok=False, status=403)):
+            with self.subTest(response=response):
+                page = mock.Mock()
+                page.goto.return_value = response
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Canvas course section",
+                ):
+                    canvas.fetch_canvas_web_target(
+                        page,
+                        target_url,
+                        courses=[],
+                    )
+                page.unroute.assert_called_once_with(
+                    "**/*",
+                    canvas._canvas_navigation_guard,
+                )
+
+    def test_fetch_canvas_web_target_rejects_final_url_outside_course(self):
+        page = mock.Mock()
+        page.goto.return_value = mock.Mock(ok=True, status=200)
+        page.url = "https://ufl.instructure.com/courses/123/announcements"
+        target_url = "https://ufl.instructure.com/courses/574892/announcements"
+
+        with self.assertRaisesRegex(RuntimeError, "requested course"):
+            canvas.fetch_canvas_web_target(page, target_url, courses=[])
+
+        page.unroute.assert_called_once_with(
+            "**/*",
+            canvas._canvas_navigation_guard,
+        )
+
+    def test_download_attachment_uses_authenticated_context_and_avoids_overwrite(self):
+        response = mock.Mock()
+        response.ok = True
+        response.status = 200
+        response.body.return_value = b"handout contents"
+        page = mock.Mock()
+        page.context.request.get.return_value = response
+        attachment = {
+            "name": "handout.pdf",
+            "file_id": 44,
+            "url": "https://ufl.instructure.com/files/44/download",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = canvas.download_attachment(page, attachment, directory)
+            second = canvas.download_attachment(page, attachment, directory)
+
+            self.assertEqual(first.name, "handout.pdf")
+            self.assertEqual(second.name, "handout (2).pdf")
+            self.assertEqual(first.read_bytes(), b"handout contents")
+            self.assertEqual(second.read_bytes(), b"handout contents")
+
+        page.context.request.get.assert_called_with(
+            "https://ufl.instructure.com/files/44/download",
+            timeout=60_000,
+        )
+
+    def test_main_fetches_exact_quiz_and_downloads_requested_attachments(self):
+        context = mock.Mock()
+        page = object()
+        context.pages = [page]
+        sync = mock.Mock()
+        sync.__enter__ = mock.Mock(return_value=object())
+        sync.__exit__ = mock.Mock(return_value=None)
+        courses = [
+            {"id": 570905, "course_code": "NUR3145", "name": "Pharmacology"}
+        ]
+        rows = [{
+            "course": "NUR3145",
+            "course_name": "Pharmacology",
+            "title": "Reading Quiz",
+            "due_at": None,
+            "due_display": "No due date",
+            "instructions": "Read the handout.",
+            "attachments": [],
+            "url": (
+                "https://ufl.instructure.com/courses/570905/quizzes/1650213"
+            ),
+            "submission_status": None,
+        }]
+
+        with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as directory, mock.patch(
+            "sys.argv",
+            [
+                "canvas",
+                "fetch",
+                "https://ufl.instructure.com/courses/570905/quizzes/1650213",
+                "--download-dir",
+                directory,
+                "--json",
+            ],
+        ), mock.patch.object(canvas, "PROFILE_DIR", Path(profile)), mock.patch.object(
+            canvas, "sync_playwright", return_value=sync
+        ), mock.patch.object(canvas, "launch_context", return_value=context), mock.patch.object(
+            canvas, "ensure_login"
+        ), mock.patch.object(canvas, "fetch_courses", return_value=courses), mock.patch.object(
+            canvas, "fetch_canvas_target", return_value=rows
+        ) as fetch_target, mock.patch.object(
+            canvas, "fetch_assignments"
+        ) as fetch_assignments, mock.patch.object(
+            canvas, "download_attachments", return_value=rows
+        ) as download, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(canvas.main(), 0)
+
+        self.assertEqual(
+            fetch_target.call_args.args[1],
+            "https://ufl.instructure.com/courses/570905/quizzes/1650213",
+        )
+        self.assertEqual(fetch_target.call_args.kwargs["courses"], courses)
+        fetch_assignments.assert_not_called()
+        self.assertEqual(download.call_args.args[:3], (page, rows, directory))
+        context.close.assert_called_once()
+
+
+class SubmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.config_root = tempfile.TemporaryDirectory()
+        self.config_environment = mock.patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": self.config_root.name},
+            clear=False,
+        )
+        self.config_environment.start()
+
+    def tearDown(self):
+        self.config_environment.stop()
+        self.config_root.cleanup()
+
+    def test_prepare_file_submission_requires_online_upload_assignment(self):
+        page = object()
+        courses = [
+            {"id": 1, "course_code": "BIO101", "name": "Biology"}
+        ]
+        assignment = {
+            "id": 9,
+            "name": "Lab report",
+            "description": "Upload the report.",
+            "submission_types": ["online_upload"],
+            "allowed_extensions": ["pdf"],
+            "html_url": "https://ufl.instructure.com/courses/1/assignments/9",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "report.pdf"
+            file_path.write_bytes(b"report")
+            with mock.patch.object(canvas, "api_get", return_value=assignment) as api_get:
+                plan = canvas.prepare_file_submission(
+                    page,
+                    "https://ufl.instructure.com/courses/1/assignments/9",
+                    [str(file_path)],
+                    courses=courses,
+                    tz=canvas.ZoneInfo("UTC"),
+                )
+
+        api_get.assert_called_once_with(
+            page,
+            "/api/v1/courses/1/assignments/9",
+            [("include[]", "submission")],
+        )
+        self.assertEqual(plan["course_id"], 1)
+        self.assertEqual(plan["assignment_id"], 9)
+        self.assertEqual(plan["files"], [file_path])
+
+    def test_prepare_file_submission_rejects_quiz_url(self):
+        with self.assertRaisesRegex(ValueError, "quiz URLs"):
+            canvas.prepare_file_submission(
+                object(),
+                "https://ufl.instructure.com/courses/1/quizzes/9",
+                ["/tmp/does-not-matter.pdf"],
+                courses=[],
+            )
+
+    def test_submit_file_assignment_runs_canvas_upload_workflow(self):
+        initial_response = mock.Mock(ok=True, status=200)
+        initial_response.text.return_value = json.dumps({
+            "upload_url": "https://uploads.example.test/token",
+            "upload_params": {"key": "signed-key", "policy": "signed-policy"},
+        })
+        upload_response = mock.Mock(
+            ok=True,
+            status=201,
+            headers={
+                "location": (
+                    "https://ufl.instructure.com/api/v1/files/"
+                    "55/create_success?uuid=test"
+                )
+            },
+        )
+        completion_response = mock.Mock(ok=True, status=200)
+        completion_response.text.return_value = json.dumps({
+            "id": 55,
+            "display_name": "report.pdf",
+        })
+        submission_response = mock.Mock(ok=True, status=200)
+        submission_response.text.return_value = json.dumps({
+            "id": 77,
+            "workflow_state": "submitted",
+        })
+        request = mock.Mock()
+        request.post.side_effect = [
+            initial_response,
+            upload_response,
+            submission_response,
+        ]
+        request.get.return_value = completion_response
+        page = mock.Mock()
+        page.context.request = request
+        page.context.cookies.return_value = [
+            {
+                "name": "_csrf_token",
+                "value": "wrong-domain",
+                "domain": "evil.instructure.com",
+            },
+            {
+                "name": "_csrf_token",
+                "value": "csrf%2Fvalue",
+                "domain": ".instructure.com",
+            },
+        ]
+        assignment_row = {
+            "course": "BIO101",
+            "title": "Lab report",
+            "url": "https://ufl.instructure.com/courses/1/assignments/9",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "report.pdf"
+            file_path.write_bytes(b"report contents")
+            result = canvas.submit_file_assignment(
+                page,
+                {
+                    "course_id": 1,
+                    "assignment_id": 9,
+                    "files": [file_path],
+                    "assignment": assignment_row,
+                },
+            )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["files"][0]["file_id"], 55)
+        self.assertEqual(request.post.call_args_list[0].args[0], (
+            "https://ufl.instructure.com/api/v1/courses/1/assignments/"
+            "9/submissions/self/files"
+        ))
+        upload_fields = request.post.call_args_list[1].kwargs["multipart"]._fields
+        self.assertEqual(
+            [name for name, _ in upload_fields],
+            ["key", "policy", "file"],
+        )
+        self.assertEqual(upload_fields[-1][1]["name"], "report.pdf")
+        self.assertEqual(
+            request.post.call_args_list[0].kwargs["headers"]["X-CSRF-Token"],
+            "csrf/value",
+        )
+        self.assertNotIn(
+            "X-CSRF-Token",
+            request.post.call_args_list[1].kwargs["headers"],
+        )
+        self.assertEqual(
+            request.post.call_args_list[2].kwargs["headers"]["X-CSRF-Token"],
+            "csrf/value",
+        )
+        request.get.assert_called_once_with(
+            "https://ufl.instructure.com/api/v1/files/"
+            "55/create_success?uuid=test",
+            headers={"Accept": "application/json"},
+            timeout=60_000,
+        )
+        submission_fields = request.post.call_args_list[2].kwargs["multipart"]._fields
+        self.assertEqual(
+            submission_fields,
+            [
+                ("submission[submission_type]", "online_upload"),
+                ("submission[file_ids][]", "55"),
+            ],
+        )
+
+    def test_upload_submission_file_follows_redirect_completion(self):
+        initial_response = mock.Mock(ok=True, status=200)
+        initial_response.text.return_value = json.dumps({
+            "upload_url": "https://uploads.example.test/token",
+            "upload_params": {"key": "signed-key"},
+        })
+        upload_response = mock.Mock(
+            ok=False,
+            status=303,
+            headers={
+                "location": (
+                    "https://ufl.instructure.com/api/v1/files/"
+                    "55/create_success?uuid=redirect"
+                )
+            },
+        )
+        upload_response.text.return_value = "redirecting"
+        completion_response = mock.Mock(ok=True, status=200)
+        completion_response.text.return_value = json.dumps({"id": 55})
+        request = mock.Mock()
+        request.post.side_effect = [initial_response, upload_response]
+        request.get.return_value = completion_response
+        page = mock.Mock()
+        page.context.request = request
+
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "report.pdf"
+            file_path.write_bytes(b"report contents")
+            result = canvas._upload_submission_file(page, 1, 9, file_path)
+
+        self.assertEqual(result["id"], 55)
+        request.get.assert_called_once_with(
+            "https://ufl.instructure.com/api/v1/files/"
+            "55/create_success?uuid=redirect",
+            headers={"Accept": "application/json"},
+            timeout=60_000,
+        )
+
+    def test_confirm_file_submission_requires_exact_submit_word(self):
+        plan = {
+            "assignment": {"title": "Lab report", "course": "BIO101"},
+            "files": [Path("report.pdf")],
+        }
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        stdin.readline.return_value = "SUBMIT\n"
+        stderr_stream = io.StringIO()
+        stderr = mock.Mock(wraps=stderr_stream)
+        stderr.isatty.return_value = True
+
+        with mock.patch.object(canvas.sys, "stdin", stdin), mock.patch.object(
+            canvas.sys, "stderr", stderr
+        ):
+            canvas.confirm_file_submission(plan)
+
+        self.assertIn("Type SUBMIT to continue:", stderr_stream.getvalue())
+
+    def test_confirm_file_submission_rejects_other_input(self):
+        plan = {
+            "assignment": {"title": "Lab report", "course": "BIO101"},
+            "files": [Path("report.pdf")],
+        }
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        stdin.readline.return_value = "submit\n"
+        stderr = mock.Mock()
+        stderr.isatty.return_value = True
+
+        with mock.patch.object(canvas.sys, "stdin", stdin), mock.patch.object(
+            canvas.sys, "stderr", stderr
+        ):
+            with self.assertRaisesRegex(
+                canvas.SubmissionCancelled, "Canvas was not changed"
+            ):
+                canvas.confirm_file_submission(plan)
+
+    def test_main_submit_dry_run_never_posts(self):
+        context = mock.Mock()
+        context.pages = [object()]
+        sync = mock.Mock()
+        sync.__enter__ = mock.Mock(return_value=object())
+        sync.__exit__ = mock.Mock(return_value=None)
+        courses = [
+            {"id": 1, "course_code": "BIO101", "name": "Biology"}
+        ]
+        assignment = {
+            "id": 9,
+            "name": "Lab report",
+            "description": "Upload the report.",
+            "submission_types": ["online_upload"],
+            "allowed_extensions": ["pdf"],
+            "html_url": "https://ufl.instructure.com/courses/1/assignments/9",
+        }
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "report.pdf"
+            file_path.write_bytes(b"report")
+            with mock.patch(
+                "sys.argv",
+                [
+                    "canvas",
+                    "submit",
+                    "https://ufl.instructure.com/courses/1/assignments/9",
+                    "--file",
+                    str(file_path),
+                    "--dry-run",
+                    "--json",
+                ],
+            ), mock.patch.object(canvas, "PROFILE_DIR", Path(profile)), mock.patch.object(
+                canvas, "sync_playwright", return_value=sync
+            ), mock.patch.object(canvas, "launch_context", return_value=context), mock.patch.object(
+                canvas, "ensure_login"
+            ), mock.patch.object(canvas, "fetch_courses", return_value=courses), mock.patch.object(
+                canvas, "api_get", return_value=assignment
+            ), mock.patch.object(canvas, "api_post") as api_post, contextlib.redirect_stdout(
+                output
+            ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(canvas.main(), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["submitted"])
+        api_post.assert_not_called()
+
+
+class HelpTests(unittest.TestCase):
+    def test_help_lists_commands_and_options(self):
+        output = io.StringIO()
+        with mock.patch("sys.argv", ["canvas", "--help"]), contextlib.redirect_stdout(
+            output
+        ):
+            with self.assertRaises(SystemExit) as exit_error:
+                canvas.main()
+
+        self.assertEqual(exit_error.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("options:", help_text)
+        for command in (
+            "(no command)",
+            "auth setup",
+            "student on|off|status",
+            "course COURSE_ID",
+            "fetch CANVAS_URL",
+            "submit ASSIGNMENT_URL --file PATH",
+        ):
+            self.assertIn(command, help_text)
 
 
 class ShortenTests(unittest.TestCase):
